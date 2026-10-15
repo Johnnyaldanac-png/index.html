@@ -5,11 +5,68 @@ import fs from "fs";
 import { Resend } from "resend";
 import nodemailer from "nodemailer";
 import dotenv from "dotenv";
+import { createClient, SupabaseClient } from "@supabase/supabase-js";
 
 dotenv.config();
 
 const app = express();
 const PORT = 3000;
+
+// Lazy initialization of Supabase Server Client
+let supabaseServer: SupabaseClient | null = null;
+function getSupabaseServer(): SupabaseClient | null {
+  const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY;
+  if (!url || !key) return null;
+  if (!supabaseServer) {
+    supabaseServer = createClient(url, key, {
+      auth: { persistSession: false },
+    });
+  }
+  return supabaseServer;
+}
+
+// In-app fallback JSON persistence store for registrations (ensures zero data loss)
+const DATA_DIR = path.resolve(process.cwd(), "data");
+const REGISTRATIONS_FILE = path.join(DATA_DIR, "registrations.json");
+
+function ensureDataFile() {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+  if (!fs.existsSync(REGISTRATIONS_FILE)) {
+    fs.writeFileSync(REGISTRATIONS_FILE, JSON.stringify([], null, 2), "utf8");
+  }
+}
+
+function loadLocalRegistrations(): any[] {
+  try {
+    ensureDataFile();
+    const data = fs.readFileSync(REGISTRATIONS_FILE, "utf8");
+    return JSON.parse(data) || [];
+  } catch (err) {
+    console.error("Error reading local registrations:", err);
+    return [];
+  }
+}
+
+function saveLocalRegistration(record: any): any {
+  try {
+    ensureDataFile();
+    const list = loadLocalRegistrations();
+    const existingIndex = list.findIndex((r) => r.id === record.id);
+    if (existingIndex >= 0) {
+      list[existingIndex] = { ...list[existingIndex], ...record, updated_at: new Date().toISOString() };
+    } else {
+      list.unshift(record);
+    }
+    fs.writeFileSync(REGISTRATIONS_FILE, JSON.stringify(list, null, 2), "utf8");
+    return record;
+  } catch (err) {
+    console.error("Error saving local registration:", err);
+    return record;
+  }
+}
 
 // Lazy initialization of Resend
 let resend: Resend | null = null;
@@ -270,44 +327,435 @@ async function startServer() {
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
 
-  // API Routes
-  app.post("/api/register", async (req, res) => {
+  // Middleware: Require Supabase Auth (or Admin Token) for private endpoints
+  const requireSupabaseAuth = async (req: express.Request, res: express.Response, next: express.NextFunction) => {
     try {
-      const {
-        fullName,
-        email,
-        cedula,
-        birthDay,
-        birthMonth,
-        birthYear,
-      } = req.body;
+      const authHeader = req.headers.authorization;
+      const adminHeaderKey = req.headers["x-admin-key"];
+      const configuredSecret = process.env.ADMIN_SECRET || "Megustalapasta11.";
 
-      if (!fullName || !email || !cedula) {
-        console.error("Missing required fields:", { fullName, email, cedula });
-        return res.status(400).json({ error: "Faltan campos requeridos en el servidor" });
+      // 1. Direct admin secret header match
+      if (adminHeaderKey && adminHeaderKey === configuredSecret) {
+        (req as any).user = { role: "admin", email: process.env.ADMIN_EMAIL || "admin@desafioelvolcan.com" };
+        return next();
       }
 
-      console.log(`📥 New registration received: ${fullName} (${email}), Cédula: ${cedula}`);
+      // 2. Bearer token evaluation
+      if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        return res.status(401).json({
+          error: "Acceso no autorizado: Se requiere token de Supabase Auth o credencial de administrador",
+          code: "UNAUTHORIZED",
+          hint: "Envía el encabezado Authorization: Bearer <supabase_token> o x-admin-key: <clave>",
+        });
+      }
 
-      // Send email notifications
-      const emailResult = await sendRegistrationEmails({
-        fullName: fullName.trim(),
-        email: email.trim().toLowerCase(),
-        cedula: cedula.trim(),
-        birthDay: String(birthDay),
-        birthMonth: String(birthMonth),
-        birthYear: String(birthYear),
+      const token = authHeader.split("Bearer ")[1]?.trim();
+
+      // Check if token matches admin secret directly
+      if (token === configuredSecret) {
+        (req as any).user = { role: "admin", email: process.env.ADMIN_EMAIL || "admin@desafioelvolcan.com" };
+        return next();
+      }
+
+      // Check with Supabase Auth if server is configured
+      const client = getSupabaseServer();
+      if (client) {
+        const { data: { user }, error } = await client.auth.getUser(token);
+        if (error || !user) {
+          return res.status(401).json({
+            error: "Token de Supabase Auth inválido o expirado",
+            details: error?.message,
+            code: "INVALID_TOKEN",
+          });
+        }
+        (req as any).user = user;
+        return next();
+      }
+
+      // If Supabase is not yet configured, reject unauthenticated calls
+      return res.status(401).json({
+        error: "Acceso restringido: Configura SUPABASE_URL y SUPABASE_ANON_KEY en las variables de entorno o utiliza la clave administrativa.",
+        code: "AUTH_CONFIG_REQUIRED",
       });
+    } catch (err: any) {
+      console.error("Auth middleware error:", err);
+      return res.status(500).json({ error: "Error de verificación de autenticación" });
+    }
+  };
 
-      res.status(200).json({ 
-        success: true, 
+  // =========================================================================
+  // 1. PUBLIC ENDPOINT: CREAR REGISTRO (POST /api/registrations & /api/register)
+  // Accesible para todo el público sin necesidad de autenticación
+  // =========================================================================
+  const handleCreateRegistration = async (req: express.Request, res: express.Response) => {
+    try {
+      const body = req.body;
+
+      // Extract individual fields (support both Spanish and camelCase keys)
+      let nombre = body.nombre || body.firstName || "";
+      let apellido = body.apellido || body.lastName || "";
+      const fullName = body.fullName || "";
+
+      // Fallback: If only fullName was sent, split into nombre and apellido
+      if (!nombre && fullName) {
+        const parts = fullName.trim().split(" ");
+        nombre = parts[0] || "";
+        apellido = parts.slice(1).join(" ") || "";
+      }
+
+      const cedula = (body.cedula || body.idNumber || "").trim();
+      const correo_electronico = (body.correo_electronico || body.email || "").trim().toLowerCase();
+      
+      // Birth date parsing
+      let birthDay = String(body.birthDay || "");
+      let birthMonth = String(body.birthMonth || "");
+      let birthYear = String(body.birthYear || "");
+      let fecha_nacimiento = body.fecha_nacimiento || body.birthDate || "";
+
+      if (!fecha_nacimiento && birthYear && birthMonth && birthDay) {
+        fecha_nacimiento = `${birthYear}-${birthMonth.padStart(2, "0")}-${birthDay.padStart(2, "0")}`;
+      } else if (fecha_nacimiento && (!birthYear || !birthMonth || !birthDay)) {
+        const parts = fecha_nacimiento.split("-");
+        if (parts.length === 3) {
+          birthYear = parts[0];
+          birthMonth = parts[1];
+          birthDay = parts[2];
+        }
+      }
+
+      // Validation of required fields
+      if (!nombre || !apellido || !cedula || !correo_electronico || !fecha_nacimiento) {
+        return res.status(400).json({
+          error: "Faltan campos obligatorios para el registro",
+          required: ["nombre", "apellido", "cedula", "correo_electronico", "fecha_nacimiento"],
+          received: { nombre, apellido, cedula, correo_electronico, fecha_nacimiento },
+        });
+      }
+
+      const edad = body.edad || (birthYear && birthMonth && birthDay ? (() => {
+        const bDate = new Date(parseInt(birthYear), parseInt(birthMonth) - 1, parseInt(birthDay));
+        const today = new Date();
+        let a = today.getFullYear() - bDate.getFullYear();
+        const mDiff = today.getMonth() - bDate.getMonth();
+        if (mDiff < 0 || (mDiff === 0 && today.getDate() < bDate.getDate())) a--;
+        return Math.max(0, a);
+      })() : null);
+
+      const categoria = body.categoria || calculateCategory(birthDay, birthMonth, birthYear);
+      const telefono = body.telefono || null;
+
+      const newRegistration = {
+        id: `reg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        nombre: nombre.trim(),
+        apellido: apellido.trim(),
+        cedula: cedula.trim(),
+        correo_electronico: correo_electronico.trim(),
+        fecha_nacimiento: fecha_nacimiento,
+        categoria: categoria,
+        edad: edad,
+        telefono: telefono,
+        estado: body.estado || "confirmado",
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+
+      // 1. Save to Supabase if configured
+      const supabase = getSupabaseServer();
+      let savedToSupabase = false;
+      let supabaseError = null;
+
+      if (supabase) {
+        try {
+          const { data, error } = await supabase
+            .from("registrations")
+            .insert([
+              {
+                nombre: newRegistration.nombre,
+                apellido: newRegistration.apellido,
+                cedula: newRegistration.cedula,
+                correo_electronico: newRegistration.correo_electronico,
+                fecha_nacimiento: newRegistration.fecha_nacimiento,
+                categoria: newRegistration.categoria,
+                edad: newRegistration.edad,
+                telefono: newRegistration.telefono,
+                estado: newRegistration.estado,
+              },
+            ])
+            .select()
+            .single();
+
+          if (!error && data) {
+            newRegistration.id = data.id;
+            savedToSupabase = true;
+            console.log(`✅ Registro guardado en Supabase (ID: ${data.id})`);
+          } else if (error) {
+            console.warn("⚠️ Advertencia al guardar en Supabase:", error.message);
+            supabaseError = error.message;
+          }
+        } catch (sbErr: any) {
+          console.error("⚠️ Excepción al insertar en Supabase:", sbErr?.message || sbErr);
+          supabaseError = sbErr?.message;
+        }
+      }
+
+      // 2. Save to local persistence store (ensures backup and instant availability)
+      saveLocalRegistration(newRegistration);
+      console.log(`📥 Inscripción procesada exitosamente: ${nombre} ${apellido} (${cedula})`);
+
+      // 3. Dispatch confirmation emails in background
+      let emailDetails = null;
+      try {
+        emailDetails = await sendRegistrationEmails({
+          fullName: `${nombre} ${apellido}`.trim(),
+          email: correo_electronico,
+          cedula: cedula,
+          birthDay: birthDay || "01",
+          birthMonth: birthMonth || "01",
+          birthYear: birthYear || "2000",
+        });
+      } catch (mailErr) {
+        console.warn("Email notification skipped/failed:", mailErr);
+      }
+
+      return res.status(201).json({
+        success: true,
         message: "Registro procesado con éxito",
-        emailDetails: emailResult
+        savedToSupabase,
+        supabaseError,
+        registration: newRegistration,
+        emailDetails,
       });
     } catch (error: any) {
-      console.error("Global Server error:", error);
-      res.status(500).json({ error: `Error interno del servidor: ${error.message || 'Error desconocido'}` });
+      console.error("Error al crear registro:", error);
+      return res.status(500).json({
+        error: `Error interno al procesar registro: ${error.message || "Error desconocido"}`,
+      });
     }
+  };
+
+  app.post("/api/registrations", handleCreateRegistration);
+  app.post("/api/register", handleCreateRegistration);
+
+  // =========================================================================
+  // 2. PRIVATE ENDPOINT: LEER REGISTROS (GET /api/registrations)
+  // Requiere autenticación con Supabase Auth o token de administrador
+  // =========================================================================
+  app.get("/api/registrations", requireSupabaseAuth, async (req, res) => {
+    try {
+      const supabase = getSupabaseServer();
+      let registrations: any[] = [];
+      let source = "local";
+
+      if (supabase) {
+        try {
+          const { data, error } = await supabase
+            .from("registrations")
+            .select("*")
+            .order("created_at", { ascending: false });
+
+          if (!error && data) {
+            registrations = data;
+            source = "supabase";
+          } else {
+            console.warn("Fallo lectura Supabase, utilizando respaldo local:", error?.message);
+          }
+        } catch (sbErr) {
+          console.warn("Excepción lectura Supabase:", sbErr);
+        }
+      }
+
+      // If Supabase returned no rows or is not yet configured, load from local store
+      if (registrations.length === 0) {
+        registrations = loadLocalRegistrations();
+        source = "local_store";
+      }
+
+      return res.status(200).json({
+        success: true,
+        count: registrations.length,
+        source,
+        registrations,
+      });
+    } catch (error: any) {
+      console.error("Error al consultar registros:", error);
+      return res.status(500).json({ error: "Error al obtener registros de la base de datos" });
+    }
+  });
+
+  // =========================================================================
+  // 3. PRIVATE ENDPOINT: LEER UN REGISTRO POR ID (GET /api/registrations/:id)
+  // Requiere autenticación con Supabase Auth o token de administrador
+  // =========================================================================
+  app.get("/api/registrations/:id", requireSupabaseAuth, async (req, res) => {
+    try {
+      const { id } = req.params;
+      const supabase = getSupabaseServer();
+
+      if (supabase) {
+        const { data, error } = await supabase
+          .from("registrations")
+          .select("*")
+          .eq("id", id)
+          .single();
+
+        if (!error && data) {
+          return res.status(200).json({ success: true, registration: data });
+        }
+      }
+
+      // Check local store
+      const localList = loadLocalRegistrations();
+      const item = localList.find((r) => r.id === id);
+      if (item) {
+        return res.status(200).json({ success: true, registration: item });
+      }
+
+      return res.status(404).json({ error: "Registro no encontrado" });
+    } catch (error: any) {
+      console.error("Error al buscar registro:", error);
+      return res.status(500).json({ error: "Error al buscar registro" });
+    }
+  });
+
+  // =========================================================================
+  // 4. PRIVATE ENDPOINT: ACTUALIZAR REGISTRO (PUT / PATCH /api/registrations/:id)
+  // Requiere autenticación con Supabase Auth o token de administrador
+  // =========================================================================
+  const handleUpdateRegistration = async (req: express.Request, res: express.Response) => {
+    try {
+      const { id } = req.params;
+      const updates = req.body;
+
+      if (!updates || Object.keys(updates).length === 0) {
+        return res.status(400).json({ error: "No se proporcionaron campos para actualizar" });
+      }
+
+      // Sanitize updates
+      const allowedFields = [
+        "nombre",
+        "apellido",
+        "cedula",
+        "correo_electronico",
+        "fecha_nacimiento",
+        "categoria",
+        "edad",
+        "telefono",
+        "estado",
+      ];
+
+      const cleanUpdates: Record<string, any> = {
+        updated_at: new Date().toISOString(),
+      };
+
+      for (const field of allowedFields) {
+        if (updates[field] !== undefined) {
+          cleanUpdates[field] = updates[field];
+        }
+      }
+
+      // Support camelCase updates
+      if (updates.firstName) cleanUpdates.nombre = updates.firstName;
+      if (updates.lastName) cleanUpdates.apellido = updates.lastName;
+      if (updates.email) cleanUpdates.correo_electronico = updates.email;
+      if (updates.birthDate) cleanUpdates.fecha_nacimiento = updates.birthDate;
+
+      let updatedRecord: any = null;
+      const supabase = getSupabaseServer();
+
+      // 1. Update in Supabase if configured
+      if (supabase) {
+        try {
+          const { data, error } = await supabase
+            .from("registrations")
+            .update(cleanUpdates)
+            .eq("id", id)
+            .select()
+            .single();
+
+          if (!error && data) {
+            updatedRecord = data;
+          } else {
+            console.warn("Advertencia al actualizar en Supabase:", error?.message);
+          }
+        } catch (sbErr) {
+          console.warn("Excepción Supabase update:", sbErr);
+        }
+      }
+
+      // 2. Update in local store
+      const localList = loadLocalRegistrations();
+      const index = localList.findIndex((r) => r.id === id);
+      if (index >= 0) {
+        localList[index] = { ...localList[index], ...cleanUpdates };
+        fs.writeFileSync(REGISTRATIONS_FILE, JSON.stringify(localList, null, 2), "utf8");
+        if (!updatedRecord) updatedRecord = localList[index];
+      }
+
+      if (!updatedRecord) {
+        return res.status(404).json({ error: "Registro no encontrado para actualizar" });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: "Registro actualizado exitosamente",
+        registration: updatedRecord,
+      });
+    } catch (error: any) {
+      console.error("Error al actualizar registro:", error);
+      return res.status(500).json({ error: "Error interno al actualizar registro" });
+    }
+  };
+
+  app.put("/api/registrations/:id", requireSupabaseAuth, handleUpdateRegistration);
+  app.patch("/api/registrations/:id", requireSupabaseAuth, handleUpdateRegistration);
+
+  // =========================================================================
+  // 5. PRIVATE ENDPOINT: ELIMINAR REGISTRO (DELETE /api/registrations/:id)
+  // Requiere autenticación con Supabase Auth o token de administrador
+  // =========================================================================
+  app.delete("/api/registrations/:id", requireSupabaseAuth, async (req, res) => {
+    try {
+      const { id } = req.params;
+      const supabase = getSupabaseServer();
+
+      if (supabase) {
+        try {
+          await supabase.from("registrations").delete().eq("id", id);
+        } catch (sbErr) {
+          console.warn("Excepción Supabase delete:", sbErr);
+        }
+      }
+
+      // Remove from local persistence store
+      const localList = loadLocalRegistrations();
+      const updatedList = localList.filter((r) => r.id !== id);
+      fs.writeFileSync(REGISTRATIONS_FILE, JSON.stringify(updatedList, null, 2), "utf8");
+
+      return res.status(200).json({
+        success: true,
+        message: "Registro eliminado exitosamente",
+      });
+    } catch (error: any) {
+      console.error("Error al eliminar registro:", error);
+      return res.status(500).json({ error: "Error al eliminar registro" });
+    }
+  });
+
+  // Status endpoint for Supabase connection
+  app.get("/api/supabase-status", (req, res) => {
+    const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || null;
+    const hasKey = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY);
+    res.json({
+      configured: Boolean(url && hasKey),
+      url: url ? url.replace(/^https?:\/\//, "").split(".")[0] : null,
+      table: "registrations",
+      endpoints: {
+        create: "POST /api/registrations (Público)",
+        list: "GET /api/registrations (Privado - Supabase Auth)",
+        get: "GET /api/registrations/:id (Privado - Supabase Auth)",
+        update: "PUT/PATCH /api/registrations/:id (Privado - Supabase Auth)",
+      },
+    });
   });
 
   // Check email configuration status

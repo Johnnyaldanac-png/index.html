@@ -32,10 +32,13 @@ import {
   Send,
   ExternalLink,
   FileText,
-  Settings
+  Settings,
+  Database
 } from 'lucide-react';
 import { APP_CONFIG } from './config';
 import { AboutGallery } from './components/AboutGallery';
+import { AdminRegistrationsModal } from './components/AdminRegistrationsModal';
+import { createSupabaseRegistration, isSupabaseConfigured } from './lib/supabase';
 import { auth, db } from './lib/firebase';
 import { collection, addDoc, serverTimestamp, query, where, getDocs } from 'firebase/firestore';
 
@@ -73,9 +76,10 @@ export const getCategoryByAge = (age: number | null): string => {
 // --------------------------------------------------------------------------------
 
 const registrationSchema = z.object({
-  fullName: z.string().min(3, 'El nombre completo es requerido'),
+  nombre: z.string().min(2, 'El nombre es requerido (mínimo 2 letras)'),
+  apellido: z.string().min(2, 'El apellido es requerido (mínimo 2 letras)'),
   email: z.string().email('Debe ser un correo electrónico válido'),
-  cedula: z.string().min(6, 'Cédula muy corta (mínimo 6 caracteres)'),
+  cedula: z.string().min(6, 'Cédula requerida (mínimo 6 caracteres)'),
   birthDay: z.string().min(1, 'Día requerido'),
   birthMonth: z.string().min(1, 'Mes requerido'),
   birthYear: z.string().min(4, 'Año requerido'),
@@ -122,6 +126,7 @@ export default function App() {
     return saved ? JSON.parse(saved) : null;
   });
   const [showLoginModal, setShowLoginModal] = useState(false);
+  const [showAdminModal, setShowAdminModal] = useState(false);
   const [loginForm, setLoginForm] = useState({ fullName: '', idNumber: '' });
 
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -202,7 +207,9 @@ export default function App() {
   // Update effect to use session
   useEffect(() => {
     if (session) {
-      setValue('fullName', session.fullName);
+      const parts = (session.fullName || '').trim().split(' ');
+      setValue('nombre', parts[0] || '');
+      setValue('apellido', parts.slice(1).join(' ') || '');
       setValue('cedula', session.idNumber);
       fetchHistory(session.idNumber);
     }
@@ -232,27 +239,74 @@ export default function App() {
     try {
       const calculatedAge = getAge(data.birthDay, data.birthMonth, data.birthYear) || 0;
       const category = getCategoryByAge(calculatedAge);
+      const fullName = `${data.nombre.trim()} ${data.apellido.trim()}`;
+      const fechaNacimiento = `${data.birthYear}-${data.birthMonth.padStart(2, '0')}-${data.birthDay.padStart(2, '0')}`;
 
-      // 1. Prepare data for Firestore
-      const registrationData = {
-        fullName: data.fullName.trim(),
-        email: data.email.trim().toLowerCase(),
-        idNumber: data.cedula.trim(),
-        birthDay: data.birthDay,
-        birthMonth: data.birthMonth,
-        birthYear: data.birthYear,
-        age: calculatedAge,
-        category: category,
-        userId: session?.idNumber || 'anonymous',
-        createdAt: serverTimestamp(),
-        status: 'registered'
-      };
-
-      // 2. Save to Firestore
+      // 1. PUBLIC ENDPOINT: Call POST /api/registrations (saves to Supabase & local persistent database)
       try {
-        await addDoc(collection(db, 'registrations'), registrationData);
+        await fetch('/api/registrations', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            nombre: data.nombre.trim(),
+            apellido: data.apellido.trim(),
+            fullName,
+            cedula: data.cedula.trim(),
+            correo_electronico: data.email.trim().toLowerCase(),
+            email: data.email.trim().toLowerCase(),
+            fecha_nacimiento: fechaNacimiento,
+            birthDay: data.birthDay,
+            birthMonth: data.birthMonth,
+            birthYear: data.birthYear,
+            categoria: category,
+            edad: calculatedAge,
+            estado: 'confirmado',
+          }),
+        });
+      } catch (apiError) {
+        console.warn('API /api/registrations background call note:', apiError);
+      }
+
+      // 2. Client-side Supabase write if configured directly in browser
+      if (isSupabaseConfigured()) {
+        try {
+          await createSupabaseRegistration({
+            nombre: data.nombre.trim(),
+            apellido: data.apellido.trim(),
+            cedula: data.cedula.trim(),
+            correo_electronico: data.email.trim().toLowerCase(),
+            fecha_nacimiento: fechaNacimiento,
+            categoria: category,
+            edad: calculatedAge,
+          });
+        } catch (sbErr) {
+          console.warn('Client Supabase direct insert note:', sbErr);
+        }
+      }
+
+      // 3. Save to Firestore for real-time app persistence
+      try {
+        await addDoc(collection(db, 'registrations'), {
+          nombre: data.nombre.trim(),
+          apellido: data.apellido.trim(),
+          fullName,
+          email: data.email.trim().toLowerCase(),
+          idNumber: data.cedula.trim(),
+          cedula: data.cedula.trim(),
+          birthDay: data.birthDay,
+          birthMonth: data.birthMonth,
+          birthYear: data.birthYear,
+          fechaNacimiento,
+          age: calculatedAge,
+          category,
+          userId: session?.idNumber || 'anonymous',
+          createdAt: serverTimestamp(),
+          status: 'registered'
+        });
       } catch (fsError) {
-        console.warn('Firestore direct write notice:', fsError);
+        console.warn('Firestore write note:', fsError);
       }
 
       // Also keep local offline copy for participant safety
@@ -260,7 +314,17 @@ export default function App() {
         const backupKey = 'desafio_local_registrations';
         const existing = JSON.parse(localStorage.getItem(backupKey) || '[]');
         existing.unshift({
-          ...registrationData,
+          nombre: data.nombre.trim(),
+          apellido: data.apellido.trim(),
+          fullName,
+          cedula: data.cedula.trim(),
+          email: data.email.trim().toLowerCase(),
+          birthDay: data.birthDay,
+          birthMonth: data.birthMonth,
+          birthYear: data.birthYear,
+          fechaNacimiento,
+          category,
+          age: calculatedAge,
           createdAt: new Date().toISOString(),
           id: `reg_${Date.now()}`
         });
@@ -269,28 +333,8 @@ export default function App() {
         console.warn('Local backup note:', storageErr);
       }
 
-      // 3. Send email confirmation in background if configured (optional)
-      try {
-        fetch('/api/register', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            fullName: data.fullName.trim(),
-            email: data.email.trim().toLowerCase(),
-            cedula: data.cedula.trim(),
-            birthDay: data.birthDay,
-            birthMonth: data.birthMonth,
-            birthYear: data.birthYear,
-          }),
-        }).catch(() => {});
-      } catch (apiError) {
-        // background attempt only
-      }
-
       setLastRegistered({
-        fullName: data.fullName.trim(),
+        fullName,
         email: data.email.trim().toLowerCase(),
         cedula: data.cedula.trim(),
         category,
@@ -312,10 +356,27 @@ export default function App() {
   };
 
   const NavMenu = () => (
-    <div className="fixed top-6 right-6 z-50">
+    <div className="fixed top-4 sm:top-6 right-4 sm:right-6 z-50 flex items-center gap-2.5">
+      {/* DIRECT CONTROL PANEL BUTTON */}
+      <button
+        onClick={() => setShowAdminModal(true)}
+        className="flex items-center gap-2 bg-gradient-to-r from-gray-900 to-gray-800 hover:from-black hover:to-gray-900 text-white px-3.5 sm:px-4 py-2.5 sm:py-3 rounded-2xl shadow-xl border border-gray-700/60 transition-all active:scale-95 group"
+        title="Abrir Panel de Control de Corredores"
+      >
+        <div className="p-1 bg-orange-500 rounded-lg text-white group-hover:scale-110 transition-transform">
+          <Users size={14} className="stroke-[2.5]" />
+        </div>
+        <div className="flex flex-col text-left">
+          <span className="text-xs font-black tracking-tight leading-none">Panel de Control</span>
+          <span className="text-[9px] text-orange-400 font-bold leading-none mt-0.5">Corredores</span>
+        </div>
+      </button>
+
+      {/* HAMBURGER MENU BUTTON */}
       <button 
         onClick={() => setIsMenuOpen(!isMenuOpen)}
-        className="bg-white p-4 rounded-2xl shadow-xl border border-gray-100 hover:bg-gray-50 transition-all group"
+        className="bg-white p-3 sm:p-3.5 rounded-2xl shadow-xl border border-gray-100 hover:bg-gray-50 transition-all group"
+        title="Menú"
       >
         <div className="space-y-1.5">
           <motion.div 
@@ -339,7 +400,7 @@ export default function App() {
             initial={{ opacity: 0, y: 10, scale: 0.95 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: 10, scale: 0.95 }}
-            className="absolute top-20 right-0 w-64 bg-white rounded-[2rem] shadow-2xl border border-gray-100 p-4 ring-1 ring-black/5"
+            className="absolute top-16 right-0 w-64 bg-white rounded-[2rem] shadow-2xl border border-gray-100 p-4 ring-1 ring-black/5"
           >
             <nav className="flex flex-col space-y-2">
               {[
@@ -355,7 +416,7 @@ export default function App() {
                       setCurrentView(item.id as any);
                       setIsMenuOpen(false);
                     }}
-                    className={`flex items-center space-x-3 p-4 rounded-2xl font-bold transition-all ${
+                    className={`flex items-center space-x-3 p-3.5 rounded-2xl font-bold transition-all ${
                       currentView === item.id 
                       ? 'bg-orange-50 text-orange-600' 
                       : 'text-gray-500 hover:bg-gray-50 hover:text-gray-900'
@@ -367,7 +428,7 @@ export default function App() {
                 )
               ))}
 
-              <div className="pt-4 mt-4 border-t border-gray-100">
+              <div className="pt-3 mt-3 border-t border-gray-100">
                 {session ? (
                   <div className="space-y-2">
                     <div className="flex items-center space-x-3 px-4 py-2">
@@ -381,7 +442,7 @@ export default function App() {
                     </div>
                     <button
                       onClick={handleLogout}
-                      className="w-full flex items-center space-x-3 p-4 rounded-2xl font-bold text-red-500 hover:bg-red-50 transition-all"
+                      className="w-full flex items-center space-x-3 p-3.5 rounded-2xl font-bold text-red-500 hover:bg-red-50 transition-all"
                     >
                       <LogOut size={18} />
                       <span>Salir</span>
@@ -393,12 +454,28 @@ export default function App() {
                       setShowLoginModal(true);
                       setIsMenuOpen(false);
                     }}
-                    className="w-full flex items-center space-x-3 p-4 rounded-2xl font-bold text-gray-900 hover:bg-gray-50 transition-all"
+                    className="w-full flex items-center space-x-3 p-3.5 rounded-2xl font-bold text-gray-900 hover:bg-gray-50 transition-all"
                   >
                     <UserIcon size={18} />
                     <span>Acceder / Historial</span>
                   </button>
                 )}
+
+                <button
+                  onClick={() => {
+                    setShowAdminModal(true);
+                    setIsMenuOpen(false);
+                  }}
+                  className="w-full flex items-center space-x-3 p-3 rounded-2xl font-black text-white bg-gradient-to-r from-gray-900 to-gray-800 hover:from-black hover:to-gray-900 transition-all text-left mt-2 shadow-md border border-gray-800"
+                >
+                  <div className="p-1.5 bg-orange-500 text-white rounded-xl">
+                    <Users size={16} />
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="text-xs font-black">Panel de Control</span>
+                    <span className="text-[9px] text-orange-300 font-medium">Ver Corredores Inscritos</span>
+                  </div>
+                </button>
               </div>
             </nav>
           </motion.div>
@@ -599,17 +676,31 @@ export default function App() {
                       )}
                     </div>
                     
-                    {/* FULL NAME */}
-                    <div className="space-y-1.5">
-                      <label className="text-xs font-bold uppercase tracking-widest text-gray-400 ml-1 flex items-center gap-2">
-                        <UserIcon size={12} /> Nombre Completo del Atleta
-                      </label>
-                      <input
-                        {...register('fullName')}
-                        className={`w-full bg-gray-50 border-none rounded-2xl p-4 text-sm font-medium focus:ring-2 focus:ring-orange-500 transition-all ${errors.fullName ? 'ring-2 ring-red-400 bg-red-50' : ''}`}
-                        placeholder="Ej. Johnny Aldana"
-                      />
-                      {errors.fullName && <p className="text-[10px] text-red-500 font-bold ml-1">{errors.fullName.message}</p>}
+                    {/* NOMBRE Y APELLIDO (SEPARADOS) */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-bold uppercase tracking-widest text-gray-400 ml-1 flex items-center gap-2">
+                          <UserIcon size={12} /> Nombre
+                        </label>
+                        <input
+                          {...register('nombre')}
+                          className={`w-full bg-gray-50 border-none rounded-2xl p-4 text-sm font-medium focus:ring-2 focus:ring-orange-500 transition-all ${errors.nombre ? 'ring-2 ring-red-400 bg-red-50' : ''}`}
+                          placeholder="Ej. Johnny"
+                        />
+                        {errors.nombre && <p className="text-[10px] text-red-500 font-bold ml-1">{errors.nombre.message}</p>}
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-bold uppercase tracking-widest text-gray-400 ml-1 flex items-center gap-2">
+                          <UserIcon size={12} /> Apellido
+                        </label>
+                        <input
+                          {...register('apellido')}
+                          className={`w-full bg-gray-50 border-none rounded-2xl p-4 text-sm font-medium focus:ring-2 focus:ring-orange-500 transition-all ${errors.apellido ? 'ring-2 ring-red-400 bg-red-50' : ''}`}
+                          placeholder="Ej. Aldana"
+                        />
+                        {errors.apellido && <p className="text-[10px] text-red-500 font-bold ml-1">{errors.apellido.message}</p>}
+                      </div>
                     </div>
 
                     {/* EMAIL */}
@@ -725,150 +816,122 @@ export default function App() {
                   animate={{ opacity: 1, scale: 1, y: 0 }}
                   exit={{ opacity: 0, scale: 0.95, y: -12 }}
                   transition={{ duration: 0.35, ease: [0.22, 1, 0.36, 1] }}
-                  className="flex flex-col items-center justify-center flex-1 text-center space-y-5 py-4"
+                  className="flex flex-col items-center justify-center flex-1 text-center space-y-6 py-6"
                 >
-                  {/* RED WARNING ICON BADGE */}
+                  {/* SUCCESS CELEBRATION ICON */}
                   <div className="relative">
-                    <div className="w-16 h-16 bg-red-100 text-red-600 rounded-full flex items-center justify-center shadow-inner border-2 border-red-200">
-                      <AlertTriangle size={36} className="animate-pulse" />
+                    <div className="w-20 h-20 bg-emerald-50 text-emerald-600 rounded-3xl flex items-center justify-center shadow-lg shadow-emerald-500/10 border border-emerald-100">
+                      <CheckCircle2 size={46} className="text-emerald-500" />
                     </div>
-                    <span className="absolute -top-1 -right-1 text-xl animate-bounce">⚠️</span>
+                    <div className="absolute -bottom-1 -right-1 bg-orange-500 text-white p-1.5 rounded-full shadow-md">
+                      <Trophy size={14} />
+                    </div>
                   </div>
 
-                  <div className="w-full">
-                    {/* TOP WARNING PILL */}
-                    <div className="inline-flex items-center gap-1.5 px-3 py-1 bg-red-100 text-red-700 rounded-full text-xs font-black uppercase tracking-wider mb-2 border border-red-300">
-                      <ShieldAlert size={14} className="shrink-0" />
-                      <span>Paso Final Obligatorio</span>
+                  <div className="w-full max-w-lg">
+                    {/* STATUS BADGE */}
+                    <div className="inline-flex items-center gap-1.5 px-3.5 py-1 bg-emerald-50 text-emerald-700 rounded-full text-xs font-black uppercase tracking-wider mb-3 border border-emerald-200">
+                      <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                      <span>Inscripción Exitosa</span>
                     </div>
 
-                    <h2 className="text-2xl sm:text-3xl font-black tracking-tight mb-1 text-red-600">
-                      ¡Ya casi estás inscrito!
+                    {/* MAIN CONFIRMATION MESSAGE */}
+                    <h2 className="text-3xl sm:text-4xl font-black tracking-tight text-gray-900 mb-2 leading-tight">
+                      ¡Ya estás inscrito, te esperamos!
                     </h2>
-                    <p className="text-red-950 font-bold max-w-md mx-auto mb-4 text-xs sm:text-sm">
-                      Tus datos fueron pre-registrados, pero <span className="underline decoration-red-500 decoration-2">tu cupo aún NO está confirmado</span>.
+
+                    <p className="text-gray-600 font-medium max-w-md mx-auto mb-6 text-sm sm:text-base leading-relaxed">
+                      Tu registro en el <strong className="text-gray-900">Desafío El Volcán 2026</strong> ha quedado confirmado. ¡Prepárate para la montaña!
                     </p>
 
-                    {/* RED WHATSAPP CALLOUT BOX WITH WARNING STICKERS */}
-                    <div className="bg-gradient-to-b from-red-50 to-rose-50 border-2 border-red-500 rounded-3xl p-5 mb-5 text-left shadow-xl shadow-red-500/15 relative overflow-hidden">
-                      {/* WARNING STICKER TAG */}
-                      <div className="absolute top-0 right-0 bg-red-600 text-white font-black text-[10px] uppercase px-3 py-1 rounded-bl-xl shadow flex items-center gap-1">
-                        <span>🚨 ACCIÓN REQUERIDA</span>
-                      </div>
-
-                      <div className="flex items-start gap-3 mt-1">
-                        <div className="p-2.5 bg-red-600 text-white rounded-2xl shrink-0 shadow-md">
-                          <MessageCircle size={26} />
-                        </div>
-                        <div className="flex-1 pr-16 sm:pr-0">
-                          <h3 className="text-base font-black text-red-900 flex items-center gap-2">
-                            <span>Escribe al WhatsApp para finalizar</span>
-                          </h3>
-                          
-                          {/* CRITICAL NOTE */}
-                          <div className="bg-red-600 text-white p-3 rounded-2xl my-2.5 shadow-md">
-                            <p className="text-xs font-black leading-snug">
-                              ⚠️ NOTA IMPORTANTE: Si no escribes al WhatsApp NO estás inscrito. Debes escribir al WhatsApp obligatoriamente para terminar tu inscripción.
-                            </p>
-                          </div>
-
-                          <p className="text-xs text-red-800 font-medium leading-relaxed">
-                            Haz clic en el botón de abajo para enviar automáticamente tu formulario pre-llenado a nuestro WhatsApp oficial:
-                          </p>
-
-                          {lastRegistered && (
-                            <a
-                              href={`https://wa.me/584142525647?text=${encodeURIComponent(
-                                `🏆 *INSCRIPCIÓN PENDIENTE - DESAFÍO EL VOLCÁN* 🏆\n\n` +
-                                `¡Hola! Acabo de registrar mis datos en la web y quiero terminar mi inscripción:\n\n` +
-                                `👤 *Atleta:* ${lastRegistered.fullName}\n` +
-                                `🪪 *Cédula / Documento:* ${lastRegistered.cedula}\n` +
-                                `📧 *Correo:* ${lastRegistered.email}\n` +
-                                (lastRegistered.birthDay && lastRegistered.birthMonth && lastRegistered.birthYear
-                                  ? `🎂 *Nacimiento:* ${lastRegistered.birthDay.padStart(2, '0')}/${lastRegistered.birthMonth.padStart(2, '0')}/${lastRegistered.birthYear} (${lastRegistered.age} años)\n`
-                                  : `🎂 *Edad:* ${lastRegistered.age} años\n`) +
-                                `🏅 *Categoría:* ${lastRegistered.category}\n` +
-                                `📍 *Lugar:* El Volcán, Caracas (3KM Trail & Asfalto)\n\n` +
-                                `Por favor confirmen mi cupo oficial. ¡Muchas gracias!`
-                              )}`}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="mt-3 inline-flex items-center justify-center gap-3 w-full py-4 px-6 bg-red-600 hover:bg-red-700 active:scale-[0.98] text-white rounded-2xl font-black text-sm uppercase tracking-wider transition-all shadow-lg shadow-red-600/30 text-center"
-                            >
-                              <MessageCircle size={22} className="shrink-0" />
-                              <span>Enviar al WhatsApp (0414-2525647) para Completar</span>
-                            </a>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* REGISTRATION SUMMARY CARD (RED ACCENTS) */}
+                    {/* REGISTRATION VOUCHER SUMMARY */}
                     {lastRegistered && (
                       <div 
                         id="registration-voucher"
-                        className="bg-gradient-to-br from-red-500 to-rose-700 p-0.5 rounded-[1.75rem] shadow-xl text-left mb-4 overflow-hidden"
+                        className="bg-gradient-to-br from-orange-500 via-orange-600 to-amber-600 p-0.5 rounded-[2rem] shadow-xl text-left mb-6 overflow-hidden"
                       >
-                        <div className="bg-white rounded-[1.65rem] p-5 space-y-3">
+                        <div className="bg-white rounded-[1.9rem] p-6 space-y-4">
                           <div className="flex justify-between items-center border-b border-gray-100 pb-3">
                             <div>
-                              <span className="text-[10px] font-black tracking-widest text-red-600 uppercase block">Desafío El Volcán</span>
-                              <span className="text-xs font-bold text-gray-400">Ficha Técnica del Atleta</span>
+                              <span className="text-[11px] font-black tracking-widest text-orange-600 uppercase block">Desafío El Volcán • New Era</span>
+                              <span className="text-xs font-bold text-gray-400">Comprobante de Inscripción</span>
                             </div>
-                            <span className="px-2.5 py-1 bg-red-100 text-red-700 font-black text-[10px] uppercase rounded-full border border-red-200 flex items-center gap-1">
-                              <span>⏳ Pendiente de Validación</span>
+                            <span className="px-3 py-1 bg-emerald-50 text-emerald-700 font-black text-[11px] uppercase rounded-full border border-emerald-200 flex items-center gap-1.5">
+                              <CheckCircle2 size={13} className="text-emerald-500" />
+                              <span>Cupo Confirmado</span>
                             </span>
                           </div>
 
-                          <div className="space-y-2 text-xs">
+                          <div className="space-y-2.5 text-xs">
                             <div className="flex justify-between items-center py-1 border-b border-gray-50">
-                              <span className="font-bold text-gray-400 text-[11px]">Atleta</span>
-                              <span className="font-black text-gray-900 text-sm">{lastRegistered.fullName}</span>
+                              <span className="font-bold text-gray-400 text-xs">Atleta:</span>
+                              <span className="font-black text-gray-900 text-sm sm:text-base">{lastRegistered.fullName}</span>
                             </div>
                             <div className="flex justify-between items-center py-1 border-b border-gray-50">
-                              <span className="font-bold text-gray-400 text-[11px]">Cédula / Documento</span>
-                              <span className="font-bold text-gray-800">{lastRegistered.cedula}</span>
+                              <span className="font-bold text-gray-400 text-xs">Cédula / Documento:</span>
+                              <span className="font-bold text-gray-800 text-xs sm:text-sm">{lastRegistered.cedula}</span>
                             </div>
                             <div className="flex justify-between items-center py-1 border-b border-gray-50">
-                              <span className="font-bold text-gray-400 text-[11px]">Correo</span>
-                              <span className="font-medium text-gray-700">{lastRegistered.email}</span>
+                              <span className="font-bold text-gray-400 text-xs">Correo Electrónico:</span>
+                              <span className="font-medium text-gray-700 text-xs sm:text-sm">{lastRegistered.email}</span>
                             </div>
+                            {lastRegistered.birthDay && lastRegistered.birthMonth && lastRegistered.birthYear && (
+                              <div className="flex justify-between items-center py-1 border-b border-gray-50">
+                                <span className="font-bold text-gray-400 text-xs">Fecha de Nacimiento:</span>
+                                <span className="font-semibold text-gray-800 text-xs sm:text-sm">
+                                  {lastRegistered.birthDay.padStart(2, '0')}/{lastRegistered.birthMonth.padStart(2, '0')}/{lastRegistered.birthYear} ({lastRegistered.age} años)
+                                </span>
+                              </div>
+                            )}
                             <div className="flex justify-between items-center py-1 border-b border-gray-50">
-                              <span className="font-bold text-gray-400 text-[11px]">Categoría</span>
-                              <span className="font-black text-red-600">{lastRegistered.category}</span>
+                              <span className="font-bold text-gray-400 text-xs">Categoría Asignada:</span>
+                              <span className="font-black text-orange-600 text-xs sm:text-sm bg-orange-50 px-2 py-0.5 rounded-lg border border-orange-100">{lastRegistered.category}</span>
                             </div>
                             <div className="flex justify-between items-center pt-1">
-                              <span className="font-bold text-gray-400 text-[11px]">Lugar & Modalidad</span>
-                              <span className="font-bold text-gray-800">El Volcán • 3KM Trail</span>
+                              <span className="font-bold text-gray-400 text-xs">Modalidad & Ruta:</span>
+                              <span className="font-bold text-gray-800 text-xs sm:text-sm">El Volcán, Caracas • 3KM Trail</span>
                             </div>
                           </div>
                         </div>
                       </div>
                     )}
 
-                    {/* SECONDARY ACTION BUTTONS */}
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mb-4">
+                    {/* EVENT INFO NOTICE */}
+                    <div className="p-4 bg-orange-50/70 border border-orange-100 rounded-2xl text-left mb-6 flex items-start gap-3">
+                      <div className="p-2 bg-orange-500 text-white rounded-xl shrink-0 mt-0.5">
+                        <Trophy size={16} />
+                      </div>
+                      <div className="text-xs text-orange-950 space-y-1">
+                        <p className="font-black text-sm text-orange-900">
+                          ¡Nos vemos en la meta!
+                        </p>
+                        <p className="text-orange-800/90 leading-relaxed font-medium">
+                          Guarda o imprime este comprobante. El día del evento te recomendamos presentarte con 45 minutos de anticipación para el chequeo y entrega de tu número de corredor.
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* ACTION BUTTONS */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-2">
                       <button
                         type="button"
                         onClick={() => window.print()}
-                        className="flex items-center justify-center gap-2 p-3 bg-gray-100 hover:bg-gray-200 text-gray-800 rounded-2xl text-xs font-bold transition-all"
+                        className="flex items-center justify-center gap-2 p-3.5 bg-gray-900 hover:bg-black text-white rounded-2xl text-xs font-black transition-all shadow-md active:scale-[0.98]"
                       >
-                        <Printer size={15} />
-                        <span>Imprimir / Guardar en PDF</span>
+                        <Printer size={16} />
+                        <span>Imprimir / Guardar Comprobante</span>
                       </button>
 
                       <button 
-                        onClick={() => setIsSubmitted(false)}
-                        className="flex items-center justify-center gap-2 p-3 bg-red-50 hover:bg-red-100 text-red-700 rounded-2xl text-xs font-bold transition-all border border-red-200"
+                        type="button"
+                        onClick={() => {
+                          setIsSubmitted(false);
+                          reset();
+                        }}
+                        className="flex items-center justify-center gap-2 p-3.5 bg-orange-50 hover:bg-orange-100 text-orange-700 rounded-2xl text-xs font-bold transition-all border border-orange-200 active:scale-[0.98]"
                       >
-                        <span>Registrar a otro participante</span>
+                        <span>Inscribir a otro participante</span>
                       </button>
-                    </div>
-
-                    <div className="border-t border-gray-100 pt-3 text-center">
-                      <p className="text-gray-500 text-xs">
-                        Número de atención y confirmaciones: <a href="https://wa.me/584142525647" target="_blank" rel="noreferrer" className="text-red-600 font-bold hover:underline">0414-2525647</a>
-                      </p>
                     </div>
                   </div>
                 </motion.div>
@@ -1020,6 +1083,24 @@ export default function App() {
       </div>
       )}
 
+      {/* FOOTER WITH QUICK CONTROL PANEL ACCESS */}
+      <footer className="max-w-4xl mx-auto mt-12 pt-8 pb-10 border-t border-gray-200/80 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-gray-500">
+        <div className="flex items-center gap-2">
+          <span className="font-black text-gray-800">{APP_CONFIG.raceName}</span>
+          <span>•</span>
+          <span>{APP_CONFIG.eventInfo.location}</span>
+        </div>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => setShowAdminModal(true)}
+            className="flex items-center gap-1.5 font-black text-gray-700 hover:text-orange-600 bg-white px-3.5 py-1.5 rounded-xl border border-gray-200/80 shadow-xs transition-all hover:border-orange-200"
+          >
+            <Users size={14} className="text-orange-500" />
+            <span>Panel de Control (Administrador)</span>
+          </button>
+        </div>
+      </footer>
+
       {/* LOGIN MODAL */}
       <AnimatePresence>
         {showLoginModal && (
@@ -1123,6 +1204,12 @@ export default function App() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* ADMIN / SUPABASE REGISTRATIONS MODAL */}
+      <AdminRegistrationsModal
+        isOpen={showAdminModal}
+        onClose={() => setShowAdminModal(false)}
+      />
     </div>
   );
 }
