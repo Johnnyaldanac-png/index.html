@@ -4,6 +4,27 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Desafío El Volcán - Inscripciones</title>
+    <script>
+      // Suppress Vite HMR WebSocket connection errors in sandbox/iframe environments
+      window.addEventListener('unhandledrejection', function(event) {
+        if (
+          event.reason &&
+          typeof event.reason.message === 'string' &&
+          (event.reason.message.includes('WebSocket') || event.reason.message.includes('vite'))
+        ) {
+          event.preventDefault();
+        }
+      });
+      window.addEventListener('error', function(event) {
+        if (
+          event.message &&
+          typeof event.message === 'string' &&
+          (event.message.includes('WebSocket') || event.message.includes('vite'))
+        ) {
+          event.preventDefault();
+        }
+      });
+    </script>
   </head>
   <body>
     <div id="root"></div>

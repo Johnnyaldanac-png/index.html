@@ -1,3 +1,4 @@
+import http from "http";
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
@@ -788,6 +789,7 @@ async function startServer() {
 
   // Vite middleware for development vs static build in production
   const isProd = process.env.NODE_ENV === "production";
+  const httpServer = http.createServer(app);
 
   if (!isProd) {
     console.log("🛠️ Starting Vite in development mode...");
@@ -795,7 +797,7 @@ async function startServer() {
       server: { 
         middlewareMode: true,
         host: '0.0.0.0',
-        hmr: false 
+        hmr: { server: httpServer } 
       },
       appType: "spa",
     });
@@ -822,7 +824,7 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  httpServer.listen(PORT, "0.0.0.0", () => {
     console.log(`🚀 Server running on http://0.0.0.0:${PORT}`);
     console.log(`📁 Mode: ${process.env.NODE_ENV || 'development'}`);
   });
