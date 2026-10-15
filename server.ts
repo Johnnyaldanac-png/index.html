@@ -30,6 +30,7 @@ function getSupabaseServer(): SupabaseClient | null {
 // In-app fallback JSON persistence store for registrations (ensures zero data loss)
 const DATA_DIR = path.resolve(process.cwd(), "data");
 const REGISTRATIONS_FILE = path.join(DATA_DIR, "registrations.json");
+const SETTINGS_FILE = path.join(DATA_DIR, "settings.json");
 
 function ensureDataFile() {
   if (!fs.existsSync(DATA_DIR)) {
@@ -37,6 +38,31 @@ function ensureDataFile() {
   }
   if (!fs.existsSync(REGISTRATIONS_FILE)) {
     fs.writeFileSync(REGISTRATIONS_FILE, JSON.stringify([], null, 2), "utf8");
+  }
+  if (!fs.existsSync(SETTINGS_FILE)) {
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ registrationsClosed: false }, null, 2), "utf8");
+  }
+}
+
+function loadSettings(): { registrationsClosed: boolean; closedMessage?: string } {
+  try {
+    ensureDataFile();
+    const data = fs.readFileSync(SETTINGS_FILE, "utf8");
+    return JSON.parse(data) || { registrationsClosed: false };
+  } catch (err) {
+    console.error("Error reading settings:", err);
+    return { registrationsClosed: false };
+  }
+}
+
+function saveSettings(settings: { registrationsClosed: boolean; closedMessage?: string }): boolean {
+  try {
+    ensureDataFile();
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), "utf8");
+    return true;
+  } catch (err) {
+    console.error("Error saving settings:", err);
+    return false;
   }
 }
 
@@ -449,6 +475,15 @@ async function startServer() {
   // =========================================================================
   const handleCreateRegistration = async (req: express.Request, res: express.Response) => {
     try {
+      // Check if registrations are closed (cupos agotados)
+      const settings = loadSettings();
+      if (settings.registrationsClosed) {
+        return res.status(403).json({
+          error: "Las inscripciones para el Desafío El Volcán se encuentran cerradas porque los cupos se han agotado.",
+          code: "REGISTRATIONS_CLOSED",
+        });
+      }
+
       const body = req.body;
 
       // Extract individual fields (support both Spanish and camelCase keys)
@@ -463,7 +498,7 @@ async function startServer() {
         apellido = parts.slice(1).join(" ") || "";
       }
 
-      const cedula = (body.cedula || body.idNumber || "").trim();
+      const cedula = (body.celular || body.telefono || body.cedula || body.idNumber || "").trim();
       const correo_electronico = (body.correo_electronico || body.email || "").trim().toLowerCase();
       
       // Birth date parsing
@@ -487,8 +522,8 @@ async function startServer() {
       if (!nombre || !apellido || !cedula || !correo_electronico || !fecha_nacimiento) {
         return res.status(400).json({
           error: "Faltan campos obligatorios para el registro",
-          required: ["nombre", "apellido", "cedula", "correo_electronico", "fecha_nacimiento"],
-          received: { nombre, apellido, cedula, correo_electronico, fecha_nacimiento },
+          required: ["nombre", "apellido", "celular", "correo_electronico", "fecha_nacimiento"],
+          received: { nombre, apellido, celular: cedula, correo_electronico, fecha_nacimiento },
         });
       }
 
@@ -502,18 +537,19 @@ async function startServer() {
       })() : null);
 
       const categoria = body.categoria || calculateCategory(birthDay, birthMonth, birthYear);
-      const telefono = body.telefono || null;
+      const telefono = (body.celular || body.telefono || cedula || "").trim();
 
       const newRegistration = {
         id: `reg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
         nombre: nombre.trim(),
         apellido: apellido.trim(),
         cedula: cedula.trim(),
+        celular: telefono,
+        telefono: telefono,
         correo_electronico: correo_electronico.trim(),
         fecha_nacimiento: fecha_nacimiento,
         categoria: categoria,
         edad: edad,
-        telefono: telefono,
         estado: body.estado || "confirmado",
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
@@ -629,35 +665,43 @@ async function startServer() {
         source = "local_store";
       }
 
-      // Filter by query if provided
-      let filtered = allRegistrations;
-      if (q) {
-        const cleanQ = q.replace(/[^a-z0-9]/gi, "").toLowerCase();
-        filtered = allRegistrations.filter((r) => {
-          const fullName = `${r.nombre || ""} ${r.apellido || ""}`.toLowerCase();
-          const cedulaClean = String(r.cedula || "").replace(/[^a-z0-9]/gi, "").toLowerCase();
-          const rawCedula = String(r.cedula || "").toLowerCase();
-          
-          return (
-            fullName.includes(q) ||
-            rawCedula.includes(q) ||
-            (cleanQ.length > 0 && cedulaClean.includes(cleanQ))
-          );
-        });
+      // Security & Privacy: Only return results if a specific search query is provided
+      // This prevents anyone from seeing how many people are registered or downloading the full roster
+      if (!q || q.length < 2 || q === "admin") {
+        return res.json({ runners: [], source: "none", total: 0 });
       }
 
+      // Filter by query
+      const cleanQ = q.replace(/[^a-z0-9]/gi, "").toLowerCase();
+      const filtered = allRegistrations.filter((r) => {
+        const fullName = `${r.nombre || ""} ${r.apellido || ""}`.toLowerCase();
+        const phone = String(r.celular || r.telefono || r.cedula || "").toLowerCase();
+        const phoneClean = phone.replace(/[^a-z0-9]/gi, "");
+        
+        return (
+          fullName.includes(q) ||
+          phone.includes(q) ||
+          (cleanQ.length > 0 && phoneClean.includes(cleanQ))
+        );
+      });
+
       // Sanitize fields (keep public runner info, omit sensitive data)
-      const sanitized = filtered.map((r, index) => ({
-        id: r.id || `runner_${index}`,
-        nombre: r.nombre || "",
-        apellido: r.apellido || "",
-        fullName: `${r.nombre || ""} ${r.apellido || ""}`.trim(),
-        cedula: r.cedula || "",
-        categoria: r.categoria || "General",
-        edad: r.edad || null,
-        estado: r.estado || "confirmado",
-        created_at: r.created_at || new Date().toISOString(),
-      }));
+      const sanitized = filtered.map((r, index) => {
+        const phone = r.celular || r.telefono || r.cedula || "";
+        return {
+          id: r.id || `runner_${index}`,
+          nombre: r.nombre || "",
+          apellido: r.apellido || "",
+          fullName: `${r.nombre || ""} ${r.apellido || ""}`.trim(),
+          cedula: phone,
+          celular: phone,
+          telefono: phone,
+          categoria: r.categoria || "General",
+          edad: r.edad || null,
+          estado: r.estado || "confirmado",
+          created_at: r.created_at || new Date().toISOString(),
+        };
+      });
 
       return res.status(200).json({
         success: true,
@@ -679,6 +723,41 @@ async function startServer() {
   app.get("/api/runners/search", handlePublicRunnersSearch);
 
   // =========================================================================
+  // PUBLIC ENDPOINT: CONSULTAR ESTADO DE INSCRIPCIONES (GET /api/registration-status)
+  // Permite saber si las inscripciones están abiertas o cerradas (cupos agotados)
+  // =========================================================================
+  app.get("/api/registration-status", (req, res) => {
+    const settings = loadSettings();
+    return res.status(200).json({
+      isClosed: Boolean(settings.registrationsClosed),
+      isOpen: !Boolean(settings.registrationsClosed),
+      message: settings.closedMessage || "Los cupos para el evento se han agotado.",
+    });
+  });
+
+  // =========================================================================
+  // ADMIN ENDPOINT: PARAR / REABRIR INSCRIPCIONES (POST /api/admin/registration-status)
+  // =========================================================================
+  app.post("/api/admin/registration-status", (req, res) => {
+    const adminKey = req.headers["x-admin-key"] || req.headers.authorization?.replace(/^Bearer\s+/i, "");
+    if (!isValidAdminSecret(String(adminKey || ""))) {
+      return res.status(401).json({ error: "No autorizado para cambiar el estado de las inscripciones." });
+    }
+
+    const { closed, message } = req.body || {};
+    const isClosed = Boolean(closed);
+    saveSettings({
+      registrationsClosed: isClosed,
+      closedMessage: message || "Los cupos para el Desafío El Volcán se han agotado.",
+    });
+
+    return res.status(200).json({
+      success: true,
+      isClosed,
+      isOpen: !isClosed,
+      message: isClosed ? "Inscripciones cerradas (Cupos Agotados)" : "Inscripciones reabiertas exitosamente",
+    });
+  });
   // ADMIN AUTH ENDPOINT (POST /api/admin/login)
   // Permite verificar la contraseña de administración de manera flexible
   // =========================================================================

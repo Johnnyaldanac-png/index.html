@@ -34,7 +34,9 @@ import {
   FileText,
   Settings,
   Database,
-  Search
+  Search,
+  Phone,
+  Ban
 } from 'lucide-react';
 import { APP_CONFIG } from './config';
 import { AboutGallery } from './components/AboutGallery';
@@ -81,7 +83,7 @@ const registrationSchema = z.object({
   nombre: z.string().min(2, 'El nombre es requerido (mínimo 2 letras)'),
   apellido: z.string().min(2, 'El apellido es requerido (mínimo 2 letras)'),
   email: z.string().email('Debe ser un correo electrónico válido'),
-  cedula: z.string().min(6, 'Cédula requerida (mínimo 6 caracteres)'),
+  celular: z.string().min(7, 'Número de celular requerido (mínimo 7 caracteres)'),
   birthDay: z.string().min(1, 'Día requerido'),
   birthMonth: z.string().min(1, 'Mes requerido'),
   birthYear: z.string().min(4, 'Año requerido'),
@@ -123,21 +125,15 @@ const years = Array.from({ length: 95 }, (_, i) => (currentYear - i).toString())
 // --------------------------------------------------------------------------------
 
 export default function App() {
-  const [session, setSession] = useState<{ fullName: string; idNumber: string } | null>(() => {
-    const saved = localStorage.getItem('race_session');
-    return saved ? JSON.parse(saved) : null;
-  });
-  const [showLoginModal, setShowLoginModal] = useState(false);
   const [showAdminModal, setShowAdminModal] = useState(false);
   const [showPublicSearchModal, setShowPublicSearchModal] = useState(false);
-  const [loginForm, setLoginForm] = useState({ fullName: '', idNumber: '' });
 
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isSubmitted, setIsSubmitted] = useState(false);
   const [lastRegistered, setLastRegistered] = useState<{
     fullName: string;
     email: string;
-    cedula: string;
+    celular: string;
     category: string;
     age: number;
     birthDay?: string;
@@ -145,11 +141,38 @@ export default function App() {
     birthYear?: string;
   } | null>(null);
   const [submissionError, setSubmissionError] = useState<string | null>(null);
-  const [currentView, setCurrentView] = useState<'register' | 'about' | 'contact' | 'history'>('register');
+  const [currentView, setCurrentView] = useState<'register' | 'about' | 'contact'>('register');
   const [isMenuOpen, setIsMenuOpen] = useState(false);
-  const [userRegistrations, setUserRegistrations] = useState<any[]>([]);
-  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [selectedImage, setSelectedImage] = useState<{ src: string; caption: string; tag: string } | null>(null);
+
+  // Registration admission status (abiertas vs cerradas/cupos agotados)
+  const [isRegistrationsClosed, setIsRegistrationsClosed] = useState<boolean>(() => {
+    return localStorage.getItem('race_registrations_closed') === 'true';
+  });
+
+  const checkRegistrationStatus = async () => {
+    try {
+      const res = await fetch('/api/registration-status');
+      if (res.ok) {
+        const data = await res.json();
+        const closed = Boolean(data.isClosed);
+        setIsRegistrationsClosed(closed);
+        localStorage.setItem('race_registrations_closed', String(closed));
+      }
+    } catch {
+      // offline/static fallback uses localStorage
+    }
+  };
+
+  useEffect(() => {
+    checkRegistrationStatus();
+    const handleStatusChanged = () => {
+      const closed = localStorage.getItem('race_registrations_closed') === 'true';
+      setIsRegistrationsClosed(closed);
+    };
+    window.addEventListener('race_registration_status_changed', handleStatusChanged);
+    return () => window.removeEventListener('race_registration_status_changed', handleStatusChanged);
+  }, []);
 
   const {
     register,
@@ -169,33 +192,6 @@ export default function App() {
   const currentCalculatedAge = getAge(watchDay, watchMonth, watchYear);
   const currentCategory = getCategoryByAge(currentCalculatedAge);
 
-  // Fetch History by ID Number
-  const fetchHistory = async (idNumber: string) => {
-    setIsLoadingHistory(true);
-    try {
-      const q = query(
-        collection(db, 'registrations'), 
-        where('idNumber', '==', idNumber.trim())
-      );
-      const querySnapshot = await getDocs(q);
-      const regs = querySnapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      }));
-      // Safe client-side sorting
-      regs.sort((a: any, b: any) => {
-        const timeA = a.createdAt?.seconds ? a.createdAt.seconds * 1000 : (new Date(a.createdAt || 0).getTime() || 0);
-        const timeB = b.createdAt?.seconds ? b.createdAt.seconds * 1000 : (new Date(b.createdAt || 0).getTime() || 0);
-        return timeB - timeA;
-      });
-      setUserRegistrations(regs);
-    } catch (error) {
-      console.error("Error fetching history:", error);
-    } finally {
-      setIsLoadingHistory(false);
-    }
-  };
-
   // Calculate days based on month and year
   const getDaysInMonth = (month: string, year: string) => {
     if (!month) return 31;
@@ -207,35 +203,13 @@ export default function App() {
   const dynamicDaysCount = getDaysInMonth(watchMonth, watchYear);
   const dynamicDays = Array.from({ length: dynamicDaysCount }, (_, i) => (i + 1).toString());
 
-  // Update effect to use session
-  useEffect(() => {
-    if (session) {
-      const parts = (session.fullName || '').trim().split(' ');
-      setValue('nombre', parts[0] || '');
-      setValue('apellido', parts.slice(1).join(' ') || '');
-      setValue('cedula', session.idNumber);
-      fetchHistory(session.idNumber);
-    }
-  }, [session, setValue]);
-
-  const handleSimpleLogin = () => {
-    if (loginForm.fullName && loginForm.idNumber) {
-      const newSession = { fullName: loginForm.fullName.trim(), idNumber: loginForm.idNumber.trim() };
-      setSession(newSession);
-      localStorage.setItem('race_session', JSON.stringify(newSession));
-      setShowLoginModal(false);
-      setLoginForm({ fullName: '', idNumber: '' });
-    }
-  };
-
-  const handleLogout = () => {
-    setSession(null);
-    localStorage.removeItem('race_session');
-    setUserRegistrations([]);
-    reset();
-  };
-
   const onSubmit = async (data: RegistrationFormData) => {
+    if (isRegistrationsClosed) {
+      setSubmissionError("Las inscripciones para el Desafío El Volcán se encuentran cerradas porque los cupos se han agotado.");
+      alert("Lo sentimos, las inscripciones para el Desafío El Volcán están cerradas porque los cupos se han agotado.");
+      return;
+    }
+
     setIsSubmitting(true);
     setSubmissionError(null);
     
@@ -244,6 +218,7 @@ export default function App() {
       const category = getCategoryByAge(calculatedAge);
       const fullName = `${data.nombre.trim()} ${data.apellido.trim()}`;
       const fechaNacimiento = `${data.birthYear}-${data.birthMonth.padStart(2, '0')}-${data.birthDay.padStart(2, '0')}`;
+      const celularNumber = data.celular.trim();
 
       // 1.0 Save to browser local storage for instant search & offline access
       try {
@@ -254,7 +229,9 @@ export default function App() {
           nombre: data.nombre.trim(),
           apellido: data.apellido.trim(),
           fullName,
-          cedula: data.cedula.trim(),
+          cedula: celularNumber,
+          telefono: celularNumber,
+          celular: celularNumber,
           correo_electronico: data.email.trim().toLowerCase(),
           fecha_nacimiento: fechaNacimiento,
           categoria: category,
@@ -262,7 +239,7 @@ export default function App() {
           estado: 'confirmado',
           created_at: new Date().toISOString(),
         };
-        const filtered = localList.filter((r: any) => r.cedula !== data.cedula.trim());
+        const filtered = localList.filter((r: any) => (r.celular || r.cedula) !== celularNumber);
         filtered.unshift(newLocalRecord);
         localStorage.setItem('race_local_registrations', JSON.stringify(filtered));
       } catch (lsErr) {
@@ -281,7 +258,9 @@ export default function App() {
             nombre: data.nombre.trim(),
             apellido: data.apellido.trim(),
             fullName,
-            cedula: data.cedula.trim(),
+            cedula: celularNumber,
+            telefono: celularNumber,
+            celular: celularNumber,
             correo_electronico: data.email.trim().toLowerCase(),
             email: data.email.trim().toLowerCase(),
             fecha_nacimiento: fechaNacimiento,
@@ -315,7 +294,7 @@ export default function App() {
               _template: 'table',
               _captcha: 'false',
               'Atleta': fullName,
-              'Cédula / Documento': data.cedula.trim(),
+              'Número de Celular / WhatsApp': celularNumber,
               'Correo del Atleta': data.email.trim().toLowerCase(),
               'Fecha de Nacimiento': `${data.birthDay.padStart(2, '0')}/${data.birthMonth.padStart(2, '0')}/${data.birthYear}`,
               'Edad': `${calculatedAge} años`,
@@ -335,7 +314,8 @@ export default function App() {
           await createSupabaseRegistration({
             nombre: data.nombre.trim(),
             apellido: data.apellido.trim(),
-            cedula: data.cedula.trim(),
+            cedula: celularNumber,
+            telefono: celularNumber,
             correo_electronico: data.email.trim().toLowerCase(),
             fecha_nacimiento: fechaNacimiento,
             categoria: category,
@@ -353,15 +333,16 @@ export default function App() {
           apellido: data.apellido.trim(),
           fullName,
           email: data.email.trim().toLowerCase(),
-          idNumber: data.cedula.trim(),
-          cedula: data.cedula.trim(),
+          idNumber: celularNumber,
+          cedula: celularNumber,
+          telefono: celularNumber,
+          celular: celularNumber,
           birthDay: data.birthDay,
           birthMonth: data.birthMonth,
           birthYear: data.birthYear,
           fechaNacimiento,
           age: calculatedAge,
           category,
-          userId: session?.idNumber || 'anonymous',
           createdAt: serverTimestamp(),
           status: 'registered'
         });
@@ -377,7 +358,9 @@ export default function App() {
           nombre: data.nombre.trim(),
           apellido: data.apellido.trim(),
           fullName,
-          cedula: data.cedula.trim(),
+          cedula: celularNumber,
+          telefono: celularNumber,
+          celular: celularNumber,
           email: data.email.trim().toLowerCase(),
           birthDay: data.birthDay,
           birthMonth: data.birthMonth,
@@ -396,7 +379,7 @@ export default function App() {
       setLastRegistered({
         fullName,
         email: data.email.trim().toLowerCase(),
-        cedula: data.cedula.trim(),
+        celular: celularNumber,
         category,
         age: calculatedAge,
         birthDay: data.birthDay,
@@ -406,7 +389,6 @@ export default function App() {
 
       setIsSubmitted(true);
       reset();
-      if (session) fetchHistory(session.idNumber);
     } catch (error) {
       console.error('Registration Error:', error);
       setSubmissionError('Ocurrió un inconveniente al procesar la inscripción. Por favor verifica tus datos e inténtalo nuevamente.');
@@ -420,30 +402,15 @@ export default function App() {
       {/* PUBLIC RUNNER SEARCH BUTTON (OPEN FOR EVERYONE) */}
       <button
         onClick={() => setShowPublicSearchModal(true)}
-        className="flex items-center gap-2 bg-white hover:bg-orange-50 text-gray-800 hover:text-orange-600 px-3 sm:px-3.5 py-2.5 sm:py-3 rounded-2xl shadow-xl border border-gray-200/90 transition-all active:scale-95 group"
-        title="Buscar corredores inscritos por cédula o nombre (público para todos)"
+        className="flex items-center gap-2 bg-white hover:bg-orange-50 text-gray-800 hover:text-orange-600 px-3.5 sm:px-4 py-2.5 sm:py-3 rounded-2xl shadow-xl border border-gray-200/90 transition-all active:scale-95 group"
+        title="Buscar corredores inscritos por celular o nombre (público para todos)"
       >
         <div className="p-1 bg-orange-100 text-orange-600 rounded-lg group-hover:scale-110 transition-transform">
           <Search size={14} className="stroke-[2.5]" />
         </div>
         <div className="flex flex-col text-left">
           <span className="text-xs font-black tracking-tight leading-none">Buscar Corredor</span>
-          <span className="text-[9px] text-gray-500 font-bold leading-none mt-0.5 hidden xs:inline">Cédula o Nombre</span>
-        </div>
-      </button>
-
-      {/* DIRECT CONTROL PANEL BUTTON */}
-      <button
-        onClick={() => setShowAdminModal(true)}
-        className="flex items-center gap-2 bg-gradient-to-r from-gray-900 to-gray-800 hover:from-black hover:to-gray-900 text-white px-3.5 sm:px-4 py-2.5 sm:py-3 rounded-2xl shadow-xl border border-gray-700/60 transition-all active:scale-95 group"
-        title="Abrir Panel de Control de Corredores (Administración)"
-      >
-        <div className="p-1 bg-orange-500 rounded-lg text-white group-hover:scale-110 transition-transform">
-          <Users size={14} className="stroke-[2.5]" />
-        </div>
-        <div className="flex flex-col text-left">
-          <span className="text-xs font-black tracking-tight leading-none">Panel de Control</span>
-          <span className="text-[9px] text-orange-400 font-bold leading-none mt-0.5">Admin</span>
+          <span className="text-[9px] text-gray-500 font-bold leading-none mt-0.5 hidden xs:inline">Celular o Nombre</span>
         </div>
       </button>
 
@@ -480,91 +447,40 @@ export default function App() {
             <nav className="flex flex-col space-y-2">
               {[
                 { id: 'register', label: 'Inscríbete', icon: Trophy },
-                { id: 'history', label: 'Mis Inscripciones', icon: Calendar, needsAuth: true },
                 { id: 'about', label: '¿Quiénes somos?', icon: Info },
                 { id: 'contact', label: 'Contacto', icon: UserIcon }
               ].map((item) => (
-                (!item.needsAuth || session) && (
-                  <button
-                    key={item.id}
-                    onClick={() => {
-                      setCurrentView(item.id as any);
-                      setIsMenuOpen(false);
-                    }}
-                    className={`flex items-center space-x-3 p-3.5 rounded-2xl font-bold transition-all ${
-                      currentView === item.id 
-                      ? 'bg-orange-50 text-orange-600' 
-                      : 'text-gray-500 hover:bg-gray-50 hover:text-gray-900'
-                    }`}
-                  >
-                    <item.icon size={18} />
-                    <span>{item.label}</span>
-                  </button>
-                )
+                <button
+                  key={item.id}
+                  onClick={() => {
+                    setCurrentView(item.id as any);
+                    setIsMenuOpen(false);
+                  }}
+                  className={`flex items-center space-x-3 p-3.5 rounded-2xl font-bold transition-all ${
+                    currentView === item.id 
+                    ? 'bg-orange-50 text-orange-600' 
+                    : 'text-gray-500 hover:bg-gray-50 hover:text-gray-900'
+                  }`}
+                >
+                  <item.icon size={18} />
+                  <span>{item.label}</span>
+                </button>
               ))}
 
               <div className="pt-3 mt-3 border-t border-gray-100">
-                {session ? (
-                  <div className="space-y-2">
-                    <div className="flex items-center space-x-3 px-4 py-2">
-                      <div className="w-8 h-8 rounded-full bg-orange-100 flex items-center justify-center text-orange-500 font-bold text-xs">
-                        {session.fullName.charAt(0)}
-                      </div>
-                      <div className="flex flex-col">
-                        <span className="text-[10px] font-bold text-gray-900 truncate max-w-[120px]">{session.fullName}</span>
-                        <span className="text-[8px] text-gray-500 truncate max-w-[120px]">ID: {session.idNumber}</span>
-                      </div>
-                    </div>
-                    <button
-                      onClick={handleLogout}
-                      className="w-full flex items-center space-x-3 p-3.5 rounded-2xl font-bold text-red-500 hover:bg-red-50 transition-all"
-                    >
-                      <LogOut size={18} />
-                      <span>Salir</span>
-                    </button>
-                  </div>
-                ) : (
-                  <button
-                    onClick={() => {
-                      setShowLoginModal(true);
-                      setIsMenuOpen(false);
-                    }}
-                    className="w-full flex items-center space-x-3 p-3.5 rounded-2xl font-bold text-gray-900 hover:bg-gray-50 transition-all"
-                  >
-                    <UserIcon size={18} />
-                    <span>Acceder / Historial</span>
-                  </button>
-                )}
-
                 <button
                   onClick={() => {
                     setShowPublicSearchModal(true);
                     setIsMenuOpen(false);
                   }}
-                  className="w-full flex items-center space-x-3 p-3 rounded-2xl font-black text-orange-700 bg-orange-50 hover:bg-orange-100 transition-all text-left mt-2 border border-orange-200/80 shadow-xs"
+                  className="w-full flex items-center space-x-3 p-3 rounded-2xl font-black text-orange-700 bg-orange-50 hover:bg-orange-100 transition-all text-left border border-orange-200/80 shadow-xs"
                 >
                   <div className="p-1.5 bg-orange-500 text-white rounded-xl">
                     <Search size={16} />
                   </div>
                   <div className="flex flex-col">
                     <span className="text-xs font-black">Buscar Corredor</span>
-                    <span className="text-[9px] text-orange-600 font-bold">Consultar por Cédula o Nombre</span>
-                  </div>
-                </button>
-
-                <button
-                  onClick={() => {
-                    setShowAdminModal(true);
-                    setIsMenuOpen(false);
-                  }}
-                  className="w-full flex items-center space-x-3 p-3 rounded-2xl font-black text-white bg-gradient-to-r from-gray-900 to-gray-800 hover:from-black hover:to-gray-900 transition-all text-left mt-2 shadow-md border border-gray-800"
-                >
-                  <div className="p-1.5 bg-orange-500 text-white rounded-xl">
-                    <Users size={16} />
-                  </div>
-                  <div className="flex flex-col">
-                    <span className="text-xs font-black">Panel de Control</span>
-                    <span className="text-[9px] text-orange-300 font-medium">Ver Corredores Inscritos</span>
+                    <span className="text-[9px] text-orange-600 font-bold">Consultar por Celular o Nombre</span>
                   </div>
                 </button>
               </div>
@@ -675,9 +591,17 @@ export default function App() {
           className="lg:col-span-5 flex flex-col justify-start space-y-8"
         >
           <header>
-            <div className="inline-flex items-center space-x-2 px-3 py-1 bg-orange-100 text-orange-600 rounded-full text-xs font-bold uppercase tracking-wider mb-4">
-              <Trophy size={14} />
-              <span>Inscripciones Abiertas</span>
+            <div className={`inline-flex items-center space-x-2 px-3.5 py-1 rounded-full text-xs font-bold uppercase tracking-wider mb-4 border transition-colors ${
+              isRegistrationsClosed
+                ? 'bg-red-50 text-red-700 border-red-200 shadow-xs'
+                : 'bg-orange-100 text-orange-600 border-transparent'
+            }`}>
+              {isRegistrationsClosed ? (
+                <Ban size={14} className="stroke-[2.5]" />
+              ) : (
+                <Trophy size={14} />
+              )}
+              <span>{isRegistrationsClosed ? 'Inscripciones Cerradas • Cupos Agotados' : 'Inscripciones Abiertas'}</span>
             </div>
             <h1 className="text-5xl md:text-6xl font-black text-[#1a1a1a] leading-[0.9] tracking-tighter mb-2">
               {APP_CONFIG.raceName.split(' ').map((word, i) => (
@@ -739,7 +663,56 @@ export default function App() {
         >
           <div className="bg-white rounded-[2.5rem] p-8 md:p-10 shadow-2xl shadow-gray-200/50 border border-gray-50 min-h-[500px] flex flex-col">
             <AnimatePresence mode="wait">
-              {currentView === 'register' && !isSubmitted && (
+              {currentView === 'register' && !isSubmitted && isRegistrationsClosed && (
+                <motion.div
+                  key="registrations-closed-notice"
+                  initial={{ opacity: 0, y: 14, scale: 0.98 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: -12, scale: 0.98 }}
+                  className="py-10 px-4 sm:px-6 text-center space-y-6 my-auto text-left"
+                >
+                  <div className="text-center space-y-3">
+                    <div className="w-20 h-20 rounded-3xl bg-gradient-to-tr from-red-500 to-rose-600 text-white mx-auto flex items-center justify-center shadow-xl shadow-red-500/25">
+                      <Ban size={42} className="stroke-[2.5]" />
+                    </div>
+
+                    <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-black uppercase tracking-wider bg-red-100 text-red-800 border border-red-200">
+                      <AlertCircle size={13} className="stroke-[2.5]" />
+                      <span>Inscripciones Cerradas • Cupos Agotados</span>
+                    </div>
+
+                    <h2 className="text-3xl sm:text-4xl font-black text-gray-900 tracking-tight leading-tight">
+                      ¡Los Cupos se Han Agotado!
+                    </h2>
+                    <p className="text-sm text-gray-500 font-medium max-w-md mx-auto leading-relaxed">
+                      Hemos alcanzado el límite máximo de atletas participantes para el <strong className="text-gray-800 font-bold">{APP_CONFIG.raceName}</strong>. Agradecemos a toda la comunidad de corredores su masivo apoyo e interés.
+                    </p>
+                  </div>
+
+                  <div className="p-5 bg-gray-50 border border-gray-200/80 rounded-3xl max-w-md mx-auto space-y-2 text-left">
+                    <div className="flex items-center gap-2 text-xs font-black text-gray-800">
+                      <Search size={14} className="text-orange-500" />
+                      <span>¿Ya estás inscrito y deseas consultar tus datos?</span>
+                    </div>
+                    <p className="text-xs text-gray-500 leading-relaxed font-medium">
+                      Si ya completaste tu inscripción previamente, puedes ingresar a nuestro buscador con tu número de celular o nombre para ver tu estatus y comprobante oficial.
+                    </p>
+                  </div>
+
+                  <div className="pt-2 flex flex-col sm:flex-row items-center justify-center gap-3">
+                    <button
+                      type="button"
+                      onClick={() => setShowPublicSearchModal(true)}
+                      className="w-full sm:w-auto px-7 py-3.5 bg-gray-900 hover:bg-black text-white font-black rounded-2xl text-xs uppercase tracking-wider transition-all shadow-md active:scale-95 flex items-center justify-center gap-2"
+                    >
+                      <Search size={15} />
+                      <span>Consultar mi Inscripción</span>
+                    </button>
+                  </div>
+                </motion.div>
+              )}
+
+              {currentView === 'register' && !isSubmitted && !isRegistrationsClosed && (
                 <motion.form 
                   key="registration-form"
                   initial={{ opacity: 0, y: 14, scale: 0.99 }}
@@ -765,16 +738,6 @@ export default function App() {
                           <Search size={13} className="text-orange-600 stroke-[2.5]" />
                           <span>Buscar Corredor</span>
                         </button>
-                        {!session && (
-                          <button
-                            type="button"
-                            onClick={() => setShowLoginModal(true)}
-                            className="flex items-center space-x-2 px-3.5 py-2 bg-white border border-gray-200 rounded-xl text-xs font-bold hover:bg-gray-50 transition-all shadow-xs"
-                          >
-                            <UserIcon size={12} />
-                            <span>Acceso Rápido</span>
-                          </button>
-                        )}
                       </div>
                     </div>
                     
@@ -819,17 +782,18 @@ export default function App() {
                       {errors.email && <p className="text-[10px] text-red-500 font-bold ml-1">{errors.email.message}</p>}
                     </div>
 
-                    {/* CEDULA */}
+                    {/* CELULAR */}
                     <div className="space-y-1.5">
                       <label className="text-xs font-bold uppercase tracking-widest text-gray-400 ml-1 flex items-center gap-2">
-                        <CreditCard size={12} /> Cédula o Documento de Identidad
+                        <Phone size={12} /> Número de Celular / WhatsApp
                       </label>
                       <input
-                        {...register('cedula')}
-                        className={`w-full bg-gray-50 border-none rounded-2xl p-4 text-sm font-medium focus:ring-2 focus:ring-orange-500 transition-all ${errors.cedula ? 'ring-2 ring-red-400 bg-red-50' : ''}`}
-                        placeholder="V-25667889"
+                        {...register('celular')}
+                        type="tel"
+                        className={`w-full bg-gray-50 border-none rounded-2xl p-4 text-sm font-medium focus:ring-2 focus:ring-orange-500 transition-all ${errors.celular ? 'ring-2 ring-red-400 bg-red-50' : ''}`}
+                        placeholder="Ej. 0414-1234567 o +58 412 1234567"
                       />
-                      {errors.cedula && <p className="text-[10px] text-red-500 font-bold ml-1">{errors.cedula.message}</p>}
+                      {errors.celular && <p className="text-[10px] text-red-500 font-bold ml-1">{errors.celular.message}</p>}
                     </div>
 
                     {/* BIRTH DATE */}
@@ -970,8 +934,8 @@ export default function App() {
                               <span className="font-black text-gray-900 text-sm sm:text-base">{lastRegistered.fullName}</span>
                             </div>
                             <div className="flex justify-between items-center py-1 border-b border-gray-50">
-                              <span className="font-bold text-gray-400 text-xs">Cédula / Documento:</span>
-                              <span className="font-bold text-gray-800 text-xs sm:text-sm">{lastRegistered.cedula}</span>
+                              <span className="font-bold text-gray-400 text-xs">Número de Celular:</span>
+                              <span className="font-bold text-gray-800 text-xs sm:text-sm">{lastRegistered.celular}</span>
                             </div>
                             <div className="flex justify-between items-center py-1 border-b border-gray-50">
                               <span className="font-bold text-gray-400 text-xs">Correo Electrónico:</span>
@@ -1048,88 +1012,6 @@ export default function App() {
                 </motion.div>
               )}
 
-              {currentView === 'history' && (
-                <motion.div
-                  key="history-view"
-                  initial={{ opacity: 0, y: 14, scale: 0.99 }}
-                  animate={{ opacity: 1, y: 0, scale: 1 }}
-                  exit={{ opacity: 0, y: -12, scale: 0.99 }}
-                  transition={{ duration: 0.3, ease: [0.22, 1, 0.36, 1] }}
-                  className="space-y-6 py-4 text-left"
-                >
-                  <div className="flex items-center justify-between mb-2">
-                    <div>
-                      <h2 className="text-2xl font-black tracking-tight text-gray-900">Mis Inscripciones</h2>
-                      <p className="text-xs text-gray-500 font-medium">Registros asociados al documento {session?.idNumber}</p>
-                    </div>
-                    <button 
-                      onClick={() => session && fetchHistory(session.idNumber)} 
-                      disabled={isLoadingHistory}
-                      className="p-2 text-orange-500 hover:bg-orange-50 rounded-xl transition-all active:scale-95"
-                    >
-                      <motion.div animate={isLoadingHistory ? { rotate: 360 } : {}} transition={{ repeat: Infinity, duration: 1 }}>
-                        <Calendar size={20} />
-                      </motion.div>
-                    </button>
-                  </div>
-
-                  {isLoadingHistory ? (
-                     <div className="py-20 flex flex-col items-center space-y-4 opacity-50">
-                        <div className="w-12 h-12 border-4 border-orange-500 border-t-transparent rounded-full animate-spin" />
-                        <p className="text-xs font-bold uppercase tracking-widest text-gray-400">Cargando...</p>
-                     </div>
-                  ) : userRegistrations.length > 0 ? (
-                    <div className="space-y-4">
-                      {userRegistrations.map((reg) => (
-                        <div key={reg.id} className="bg-white p-6 rounded-[2rem] border border-gray-100 shadow-xl shadow-gray-200/50 relative overflow-hidden group">
-                          <div className="flex justify-between items-start mb-4">
-                            <div>
-                              <span className="text-[10px] font-black uppercase tracking-wider bg-orange-100 text-orange-600 px-3 py-1 rounded-full">
-                                {reg.category || 'Atleta Confirmado'}
-                              </span>
-                              <h3 className="text-lg font-black text-gray-900 mt-2">{reg.fullName}</h3>
-                              <p className="text-xs text-gray-500 font-bold mt-0.5">Cédula: {reg.idNumber}</p>
-                            </div>
-                            <div className="text-right">
-                              <span className="text-xs font-black text-emerald-600 bg-emerald-50 px-2.5 py-1 rounded-lg border border-emerald-100">
-                                Inscrito
-                              </span>
-                            </div>
-                          </div>
-
-                          <div className="grid grid-cols-2 gap-2 text-xs bg-gray-50 p-3.5 rounded-2xl text-gray-600">
-                            <div>
-                              <span className="text-[9px] font-bold uppercase text-gray-400 block">Nacimiento</span>
-                              <span className="font-black text-gray-800">{reg.birthDay}/{reg.birthMonth}/{reg.birthYear}</span>
-                            </div>
-                            <div>
-                              <span className="text-[9px] font-bold uppercase text-gray-400 block">Correo</span>
-                              <span className="font-semibold text-gray-800 truncate block">{reg.email}</span>
-                            </div>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="text-center py-16 bg-gray-50 rounded-3xl border border-gray-100 p-8">
-                      <div className="w-14 h-14 bg-orange-100 text-orange-600 rounded-2xl flex items-center justify-center mx-auto mb-3">
-                        <Trophy size={24} />
-                      </div>
-                      <h4 className="text-base font-black text-gray-900">No hay inscripciones registradas</h4>
-                      <p className="text-xs text-gray-500 mt-1 max-w-xs mx-auto">
-                        Aún no tienes registros vinculados a esta cédula.
-                      </p>
-                      <button
-                        onClick={() => setCurrentView('register')}
-                        className="mt-4 px-5 py-2.5 bg-orange-500 text-white font-bold rounded-xl text-xs hover:bg-orange-600 transition-all shadow-md"
-                      >
-                        Inscribirse Ahora
-                      </button>
-                    </div>
-                  )}
-                </motion.div>
-              )}
-
               {currentView === 'contact' && (
                 <motion.div
                   key="contact-view"
@@ -1194,7 +1076,7 @@ export default function App() {
       </div>
       )}
 
-      {/* FOOTER WITH QUICK CONTROL PANEL ACCESS */}
+      {/* FOOTER */}
       <footer className="max-w-4xl mx-auto mt-12 pt-8 pb-10 border-t border-gray-200/80 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-gray-500">
         <div className="flex items-center gap-2">
           <span className="font-black text-gray-800">{APP_CONFIG.raceName}</span>
@@ -1202,72 +1084,9 @@ export default function App() {
           <span>{APP_CONFIG.eventInfo.location}</span>
         </div>
         <div className="flex items-center gap-3">
-          <button
-            onClick={() => setShowAdminModal(true)}
-            className="flex items-center gap-1.5 font-black text-gray-700 hover:text-orange-600 bg-white px-3.5 py-1.5 rounded-xl border border-gray-200/80 shadow-xs transition-all hover:border-orange-200"
-          >
-            <Users size={14} className="text-orange-500" />
-            <span>Panel de Control (Administrador)</span>
-          </button>
+          <span className="text-gray-400 font-medium">Edición Oficial 2026</span>
         </div>
       </footer>
-
-      {/* LOGIN MODAL */}
-      <AnimatePresence>
-        {showLoginModal && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4"
-          >
-            <motion.div
-              initial={{ scale: 0.95, y: 10 }}
-              animate={{ scale: 1, y: 0 }}
-              exit={{ scale: 0.95, y: 10 }}
-              className="bg-white rounded-3xl p-6 md:p-8 max-w-md w-full shadow-2xl space-y-6 text-left"
-            >
-              <div className="flex justify-between items-center">
-                <h3 className="text-xl font-black text-gray-900">Acceso Rápido</h3>
-                <button 
-                  onClick={() => setShowLoginModal(false)}
-                  className="p-2 text-gray-400 hover:text-gray-600 rounded-full"
-                >
-                  <X size={20} />
-                </button>
-              </div>
-
-              <div className="space-y-4">
-                <div>
-                  <label className="text-xs font-bold text-gray-500 uppercase tracking-wider block mb-1">Nombre Completo</label>
-                  <input
-                    value={loginForm.fullName}
-                    onChange={(e) => setLoginForm(prev => ({ ...prev, fullName: e.target.value }))}
-                    className="w-full bg-gray-50 border-none rounded-2xl p-4 text-sm font-medium focus:ring-2 focus:ring-orange-500"
-                    placeholder="Ej. Johnny Aldana"
-                  />
-                </div>
-                <div>
-                  <label className="text-xs font-bold text-gray-500 uppercase tracking-wider block mb-1">Cédula de Identidad</label>
-                  <input
-                    value={loginForm.idNumber}
-                    onChange={(e) => setLoginForm(prev => ({ ...prev, idNumber: e.target.value }))}
-                    className="w-full bg-gray-50 border-none rounded-2xl p-4 text-sm font-medium focus:ring-2 focus:ring-orange-500"
-                    placeholder="Ej. V-25667889"
-                  />
-                </div>
-              </div>
-
-              <button
-                onClick={handleSimpleLogin}
-                className="w-full py-4 bg-orange-500 text-white font-black rounded-2xl hover:bg-orange-600 transition-all text-xs uppercase tracking-wider shadow-lg shadow-orange-200"
-              >
-                Continuar
-              </button>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
 
       {/* FULLSCREEN IMAGE LIGHTBOX */}
       <AnimatePresence>
@@ -1316,17 +1135,21 @@ export default function App() {
         )}
       </AnimatePresence>
 
-      {/* PUBLIC RUNNER SEARCH MODAL (FOR EVERYONE) */}
+      {/* PUBLIC RUNNER SEARCH MODAL (FOR EVERYONE & SECRET ADMIN COMMAND TRIGGER) */}
       <PublicRunnerSearchModal
         isOpen={showPublicSearchModal}
         onClose={() => setShowPublicSearchModal(false)}
+        onOpenAdmin={() => {
+          setShowPublicSearchModal(false);
+          setShowAdminModal(true);
+        }}
         onGoToRegister={() => {
           setCurrentView('register');
           window.scrollTo({ top: 0, behavior: 'smooth' });
         }}
       />
 
-      {/* ADMIN / SUPABASE REGISTRATIONS MODAL */}
+      {/* ADMIN / SUPABASE REGISTRATIONS MODAL (HIDDEN BEHIND SECRET COMMAND) */}
       <AdminRegistrationsModal
         isOpen={showAdminModal}
         onClose={() => setShowAdminModal(false)}

@@ -32,7 +32,11 @@ import {
   Award,
   Mail,
   Send,
-  CheckCircle2
+  CheckCircle2,
+  Phone,
+  PauseCircle,
+  PlayCircle,
+  Ban
 } from 'lucide-react';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
 import { APP_CONFIG } from '../config';
@@ -125,6 +129,12 @@ export function AdminRegistrationsModal({ isOpen, onClose }: AdminRegistrationsM
   const [isTestingEmail, setIsTestingEmail] = useState(false);
   const [testEmailResult, setTestEmailResult] = useState<{ success: boolean; message: string } | null>(null);
 
+  // Registration admission status (abiertas vs cerradas/cupos agotados)
+  const [isRegistrationsClosed, setIsRegistrationsClosed] = useState<boolean>(() => {
+    return localStorage.getItem('race_registrations_closed') === 'true';
+  });
+  const [isUpdatingStatus, setIsUpdatingStatus] = useState(false);
+
   // Filters state
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | 'pendiente' | 'confirmado' | 'rechazado'>('all');
@@ -151,7 +161,7 @@ export function AdminRegistrationsModal({ isOpen, onClose }: AdminRegistrationsM
 
   const sqlSchemaText = `-- ==========================================================
 -- SUPABASE SQL SCHEMA: INSCRIPCIONES DE CARRERA
--- Desafío El Volcán
+-- Desafío El Volcán (Idempotente: Seguro si la tabla ya existe)
 -- ==========================================================
 
 create table if not exists public.registrations (
@@ -160,7 +170,7 @@ create table if not exists public.registrations (
   apellido text not null,
   cedula text not null,
   correo_electronico text not null,
-  fecha_nacimiento date not null,
+  fecha_nacimiento date,
   categoria text,
   edad integer,
   telefono text,
@@ -169,22 +179,35 @@ create table if not exists public.registrations (
   updated_at timestamptz not null default now()
 );
 
+-- Asegurar columnas necesarias en caso de que la tabla ya existiera
+alter table public.registrations add column if not exists telefono text;
+alter table public.registrations add column if not exists categoria text;
+alter table public.registrations add column if not exists edad integer;
+alter table public.registrations add column if not exists estado text default 'pendiente';
+alter table public.registrations add column if not exists fecha_nacimiento date;
+
 -- Habilitar Row Level Security (RLS)
 alter table public.registrations enable row level security;
 
--- 1. PÚBLICO: Permitir crear registros sin login
+-- Eliminar políticas previas para evitar error 42710 (policy already exists)
+drop policy if exists "Permitir crear registro publicamente" on public.registrations;
+drop policy if exists "Permitir leer registros publicos o autenticados" on public.registrations;
+drop policy if exists "Solo usuarios autenticados pueden leer registros" on public.registrations;
+drop policy if exists "Solo usuarios autenticados pueden actualizar registros" on public.registrations;
+
+-- 1. PÚBLICO: Permitir crear registros desde la web
 create policy "Permitir crear registro publicamente"
 on public.registrations
 for insert to anon, authenticated
 with check (true);
 
--- 2. PRIVADO: Solo usuarios autenticados con Supabase Auth pueden leer
-create policy "Solo usuarios autenticados pueden leer registros"
+-- 2. LECTURA: Permitir consultar registros (autenticados y anónimos para el buscador)
+create policy "Permitir leer registros publicos o autenticados"
 on public.registrations
-for select to authenticated
+for select to anon, authenticated
 using (true);
 
--- 3. PRIVADO: Solo usuarios autenticados pueden actualizar registros
+-- 3. ACTUALIZACIÓN: Solo administradores autenticados
 create policy "Solo usuarios autenticados pueden actualizar registros"
 on public.registrations
 for update to authenticated
@@ -262,11 +285,62 @@ with check (true);`;
     }
   };
 
+  const fetchRegistrationSettings = async () => {
+    try {
+      const res = await fetch('/api/registration-status');
+      if (res.ok) {
+        const data = await res.json();
+        const closed = Boolean(data.isClosed);
+        setIsRegistrationsClosed(closed);
+        localStorage.setItem('race_registrations_closed', String(closed));
+      }
+    } catch {
+      // Keep local state
+    }
+  };
+
   useEffect(() => {
-    if (isOpen && authToken) {
-      fetchPrivateRegistrations(authToken);
+    if (isOpen) {
+      fetchRegistrationSettings();
+      if (authToken) {
+        fetchPrivateRegistrations(authToken);
+      }
     }
   }, [isOpen, authToken]);
+
+  const handleToggleRegistrationStatus = async (shouldClose: boolean) => {
+    const confirmMessage = shouldClose
+      ? '¿Estás seguro de que deseas PARAR las inscripciones? Los visitantes verán que los cupos se acabaron y no podrán enviar nuevos registros.'
+      : '¿Estás seguro de que deseas VOLVER A ABRIR las inscripciones? Los corredores podrán inscribirse nuevamente con normalidad.';
+
+    if (!window.confirm(confirmMessage)) {
+      return;
+    }
+
+    setIsUpdatingStatus(true);
+    try {
+      // 1. Update local state and dispatch custom event
+      setIsRegistrationsClosed(shouldClose);
+      localStorage.setItem('race_registrations_closed', String(shouldClose));
+      window.dispatchEvent(new Event('race_registration_status_changed'));
+
+      // 2. Persist to server API
+      const token = authToken || localStorage.getItem('admin_bearer_token') || 'Megustalapasta11.';
+      await fetch('/api/admin/registration-status', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+          'x-admin-key': token,
+        },
+        body: JSON.stringify({ closed: shouldClose }),
+      });
+    } catch (err: any) {
+      console.warn('Note updating registration status:', err);
+    } finally {
+      setIsUpdatingStatus(false);
+    }
+  };
 
   // Handle Login via Supabase Auth or Admin Key
   const handleLogin = async (e: React.FormEvent) => {
@@ -308,8 +382,7 @@ with check (true);`;
       const isKnownDefault = 
         cleanCandidate === 'megustalapasta11' || 
         rawKey === 'Megustalapasta11.' || 
-        rawKey === 'Megustalapasta11' ||
-        cleanCandidate === 'admin123';
+        rawKey === 'Megustalapasta11';
 
       let verified = false;
       let registrationsData: any = null;
@@ -797,16 +870,6 @@ with check (true);`;
                         {showPassword ? "Ocultar" : "Ver"}
                       </button>
                     </div>
-                    <div className="flex items-center justify-between text-[11px] text-gray-500 pt-1">
-                      <span>Clave: <strong className="text-gray-700 font-mono">Megustalapasta11.</strong></span>
-                      <button
-                        type="button"
-                        onClick={() => setAdminKeyInput('Megustalapasta11.')}
-                        className="text-orange-600 hover:text-orange-700 font-bold hover:underline"
-                      >
-                        Autocompletar clave
-                      </button>
-                    </div>
                   </div>
 
                   <button
@@ -862,6 +925,76 @@ with check (true);`;
                       <LogOut size={13} />
                       <span>Cerrar Sesión</span>
                     </button>
+                  </div>
+                </div>
+
+                {/* ADMISSION STATUS CONTROL (PARAR / REABRIR INSCRIPCIONES) */}
+                <div className={`p-4 sm:p-5 rounded-3xl border transition-all flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 shadow-sm ${
+                  isRegistrationsClosed 
+                    ? 'bg-gradient-to-r from-red-50 to-rose-50/50 border-red-200 text-red-950' 
+                    : 'bg-gradient-to-r from-emerald-50 to-teal-50/50 border-emerald-200 text-emerald-950'
+                }`}>
+                  <div className="flex items-center gap-3.5">
+                    <div className={`w-12 h-12 rounded-2xl flex items-center justify-center shrink-0 shadow-sm ${
+                      isRegistrationsClosed ? 'bg-red-500 text-white' : 'bg-emerald-500 text-white'
+                    }`}>
+                      {isRegistrationsClosed ? (
+                        <Ban size={24} className="stroke-[2.5]" />
+                      ) : (
+                        <CheckCircle2 size={24} className="stroke-[2.5]" />
+                      )}
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider ${
+                          isRegistrationsClosed 
+                            ? 'bg-red-200/90 text-red-900 border border-red-300' 
+                            : 'bg-emerald-200/90 text-emerald-900 border border-emerald-300'
+                        }`}>
+                          {isRegistrationsClosed ? '● Cupos Agotados (Cerradas)' : '● Inscripciones Abiertas'}
+                        </span>
+                        <span className="text-[11px] font-bold text-gray-500">
+                          {isRegistrationsClosed ? 'Los visitantes ven el aviso de cupos agotados' : 'Formulario público disponible'}
+                        </span>
+                      </div>
+                      <h4 className="font-black text-sm sm:text-base tracking-tight mt-1">
+                        {isRegistrationsClosed
+                          ? 'Inscripciones Detenidas — No se permiten nuevos registros'
+                          : 'Inscripciones Activas — Recibiendo nuevos participantes'}
+                      </h4>
+                    </div>
+                  </div>
+
+                  <div className="shrink-0 w-full sm:w-auto">
+                    {isRegistrationsClosed ? (
+                      <button
+                        type="button"
+                        disabled={isUpdatingStatus}
+                        onClick={() => handleToggleRegistrationStatus(false)}
+                        className="w-full sm:w-auto px-5 py-3 bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white font-black rounded-2xl text-xs uppercase tracking-wider transition-all shadow-md shadow-emerald-600/20 flex items-center justify-center gap-2 disabled:opacity-50"
+                      >
+                        {isUpdatingStatus ? (
+                          <RefreshCw size={15} className="animate-spin" />
+                        ) : (
+                          <PlayCircle size={17} />
+                        )}
+                        <span>Volver a Abrir Inscripciones</span>
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={isUpdatingStatus}
+                        onClick={() => handleToggleRegistrationStatus(true)}
+                        className="w-full sm:w-auto px-5 py-3 bg-red-600 hover:bg-red-700 active:scale-95 text-white font-black rounded-2xl text-xs uppercase tracking-wider transition-all shadow-md shadow-red-600/20 flex items-center justify-center gap-2 disabled:opacity-50"
+                      >
+                        {isUpdatingStatus ? (
+                          <RefreshCw size={15} className="animate-spin" />
+                        ) : (
+                          <PauseCircle size={17} />
+                        )}
+                        <span>Parar Inscripciones (Cupos Agotados)</span>
+                      </button>
+                    )}
                   </div>
                 </div>
 
@@ -1042,7 +1175,7 @@ with check (true);`;
                               type="text"
                               value={searchQuery}
                               onChange={(e) => setSearchQuery(e.target.value)}
-                              placeholder="Buscar por nombre o número de cédula..."
+                              placeholder="Buscar por nombre o número de celular..."
                               className="w-full bg-white border border-gray-200 focus:border-orange-500 rounded-2xl pl-10 pr-10 py-2.5 text-xs font-semibold text-gray-900 placeholder:text-gray-400 focus:ring-2 focus:ring-orange-500/20 outline-none transition-all shadow-xs"
                               autoComplete="off"
                             />
@@ -1174,7 +1307,7 @@ with check (true);`;
                             <tr>
                               <th className="p-3.5 pl-4">#</th>
                               <th className="p-3.5">Corredor</th>
-                              <th className="p-3.5">Cédula</th>
+                              <th className="p-3.5">Celular / Teléfono</th>
                               <th className="p-3.5">Contacto</th>
                               <th className="p-3.5">F. Nacimiento / Edad</th>
                               <th className="p-3.5">Categoría</th>
@@ -1206,8 +1339,9 @@ with check (true);`;
                                 </td>
 
                                 <td className="p-3.5">
-                                  <span className="font-mono font-bold text-gray-800 bg-gray-100 px-2 py-0.5 rounded-lg border border-gray-200">
-                                    <HighlightMatch text={reg.cedula} query={searchQuery} />
+                                  <span className="font-mono font-bold text-gray-800 bg-gray-100 px-2 py-0.5 rounded-lg border border-gray-200 inline-flex items-center gap-1">
+                                    <Phone size={11} className="text-orange-500" />
+                                    <HighlightMatch text={reg.telefono || reg.cedula} query={searchQuery} />
                                   </span>
                                 </td>
 
@@ -1341,7 +1475,7 @@ with check (true);`;
                       <div className="bg-white p-2.5 rounded-xl border border-gray-200 font-mono text-[11px] space-y-1 text-gray-700">
                         <p>SUPABASE_URL=https://xyzcompany.supabase.co</p>
                         <p>SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6...</p>
-                        <p>ADMIN_SECRET=Megustalapasta11.</p>
+                        <p>ADMIN_SECRET=•••••••••••• (Clave confidencial del administrador)</p>
                       </div>
                     </div>
                   </div>
@@ -1522,7 +1656,10 @@ with check (true);`;
                       <h4 className="font-black text-gray-900 text-base leading-tight">
                         {selectedRunner.nombre} {selectedRunner.apellido}
                       </h4>
-                      <p className="text-xs text-gray-400 font-mono">Cédula: {selectedRunner.cedula}</p>
+                      <p className="text-xs text-gray-500 font-mono flex items-center gap-1 mt-0.5">
+                        <Phone size={11} className="text-orange-500" />
+                        <span>Celular: {selectedRunner.telefono || selectedRunner.cedula}</span>
+                      </p>
                     </div>
                   </div>
                   <button
