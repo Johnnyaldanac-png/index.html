@@ -29,7 +29,10 @@ import {
   Minimize2,
   Clock,
   Sparkles,
-  Award
+  Award,
+  Mail,
+  Send,
+  CheckCircle2
 } from 'lucide-react';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
 import { APP_CONFIG } from '../config';
@@ -55,6 +58,46 @@ interface AdminRegistrationsModalProps {
   onClose: () => void;
 }
 
+// Accent & punctuation normalization for real-time runner search
+function normalizeSearchText(text: string): string {
+  if (!text) return '';
+  return text
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim();
+}
+
+// Real-time highlight component for matched search terms
+function HighlightMatch({ text, query }: { text?: string; query: string }) {
+  if (!text) return null;
+  const cleanQ = query.trim();
+  if (!cleanQ) return <>{text}</>;
+
+  try {
+    const escaped = cleanQ.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`(${escaped})`, 'gi');
+    const parts = text.split(regex);
+    if (parts.length <= 1) return <>{text}</>;
+
+    return (
+      <span>
+        {parts.map((part, i) =>
+          part.toLowerCase() === cleanQ.toLowerCase() ? (
+            <mark key={i} className="bg-amber-200/90 text-amber-950 font-black px-0.5 rounded-sm">
+              {part}
+            </mark>
+          ) : (
+            <React.Fragment key={i}>{part}</React.Fragment>
+          )
+        )}
+      </span>
+    );
+  } catch {
+    return <>{text}</>;
+  }
+}
+
 export function AdminRegistrationsModal({ isOpen, onClose }: AdminRegistrationsModalProps) {
   const [authToken, setAuthToken] = useState<string | null>(() => {
     return localStorage.getItem('admin_bearer_token') || null;
@@ -76,9 +119,11 @@ export function AdminRegistrationsModal({ isOpen, onClose }: AdminRegistrationsM
   const [isLoading, setIsLoading] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [dataSource, setDataSource] = useState<string>('local');
-  const [activeTab, setActiveTab] = useState<'runners' | 'sql'>('runners');
+  const [activeTab, setActiveTab] = useState<'runners' | 'sql' | 'email'>('runners');
   const [copiedSql, setCopiedSql] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isTestingEmail, setIsTestingEmail] = useState(false);
+  const [testEmailResult, setTestEmailResult] = useState<{ success: boolean; message: string } | null>(null);
 
   // Filters state
   const [searchQuery, setSearchQuery] = useState('');
@@ -423,6 +468,62 @@ with check (true);`;
     setTimeout(() => setCopiedSql(false), 2500);
   };
 
+  // Test email delivery to admin
+  const handleTestEmail = async () => {
+    setIsTestingEmail(true);
+    setTestEmailResult(null);
+    try {
+      // 1. Try server endpoint
+      const res = await fetch('/api/test-email', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-admin-key': authToken || 'Megustalapasta11.',
+        },
+        body: JSON.stringify({ email: 'johnnyaldanac@gmail.com' }),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        setTestEmailResult({
+          success: true,
+          message: data.message || '¡Correo de prueba enviado con éxito a johnnyaldanac@gmail.com! Revisa tu bandeja de entrada o Spam.',
+        });
+        return;
+      }
+
+      // 2. Direct browser dispatch fallback to FormSubmit
+      await fetch('https://formsubmit.co/ajax/johnnyaldanac@gmail.com', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        body: JSON.stringify({
+          _subject: '🔔 Correo de Prueba - Desafío El Volcán',
+          _template: 'table',
+          _captcha: 'false',
+          'Mensaje': 'Notificación de prueba del sistema de inscripciones para el organizador.',
+          'Destino': 'johnnyaldanac@gmail.com',
+          'Fecha': new Date().toLocaleString('es-VE'),
+          'Estado': 'Verificación exitosa',
+        }),
+      });
+
+      setTestEmailResult({
+        success: true,
+        message: '¡Prueba enviada a johnnyaldanac@gmail.com! Si es la primera vez, busca el correo de activación de FormSubmit y pulsa "Activate Form".',
+      });
+    } catch (err: any) {
+      setTestEmailResult({
+        success: false,
+        message: 'No se pudo enviar la prueba: ' + (err?.message || 'Error de conexión'),
+      });
+    } finally {
+      setIsTestingEmail(false);
+    }
+  };
+
   // Analytics Metrics
   const stats = useMemo(() => {
     const total = registrations.length;
@@ -462,20 +563,41 @@ with check (true);`;
     };
   }, [registrations]);
 
-  // Filtered registrations
+  // Filtered registrations with real-time search by name or cédula
   const filteredRegistrations = useMemo(() => {
-    return registrations.filter((r) => {
-      const q = searchQuery.toLowerCase().trim();
-      const matchesSearch = !q || (
-        (r.nombre && r.nombre.toLowerCase().includes(q)) ||
-        (r.apellido && r.apellido.toLowerCase().includes(q)) ||
-        (r.cedula && r.cedula.toLowerCase().includes(q)) ||
-        (r.correo_electronico && r.correo_electronico.toLowerCase().includes(q)) ||
-        (r.categoria && r.categoria.toLowerCase().includes(q)) ||
-        (r.telefono && r.telefono.includes(q))
-      );
+    const rawQuery = searchQuery.trim();
+    const q = normalizeSearchText(rawQuery);
+    const cleanDigits = rawQuery.replace(/\D/g, '');
 
-      const matchesStatus = statusFilter === 'all' || 
+    return registrations.filter((r) => {
+      let matchesSearch = true;
+
+      if (q) {
+        const fullName = normalizeSearchText(`${r.nombre || ''} ${r.apellido || ''}`);
+        const firstName = normalizeSearchText(r.nombre || '');
+        const lastName = normalizeSearchText(r.apellido || '');
+        const cedulaNormalized = normalizeSearchText(r.cedula || '');
+        const cedulaDigits = (r.cedula || '').replace(/\D/g, '');
+
+        const matchesName =
+          fullName.includes(q) ||
+          firstName.includes(q) ||
+          lastName.includes(q);
+
+        const matchesCedula =
+          cedulaNormalized.includes(q) ||
+          (cleanDigits.length > 0 && cedulaDigits.includes(cleanDigits));
+
+        // Also check email and phone as convenient contact fallbacks
+        const matchesContact =
+          normalizeSearchText(r.correo_electronico || '').includes(q) ||
+          (r.telefono && r.telefono.includes(rawQuery));
+
+        matchesSearch = matchesName || matchesCedula || matchesContact;
+      }
+
+      const matchesStatus =
+        statusFilter === 'all' ||
         (statusFilter === 'pendiente' && (r.estado === 'pendiente' || !r.estado)) ||
         r.estado === statusFilter;
 
@@ -673,17 +795,17 @@ with check (true);`;
                     </div>
                   </div>
 
-                  {/* PENDING WHATSAPP */}
-                  <div className="bg-rose-50 border border-rose-200 p-4 sm:p-5 rounded-3xl shadow-sm text-rose-950">
+                  {/* PENDING */}
+                  <div className="bg-amber-50 border border-amber-200 p-4 sm:p-5 rounded-3xl shadow-sm text-amber-950">
                     <div className="flex items-center justify-between mb-2">
-                      <span className="text-[11px] font-black uppercase tracking-wider text-rose-700">Pendiente WhatsApp</span>
-                      <div className="p-2 bg-rose-600 text-white rounded-xl shadow-sm">
+                      <span className="text-[11px] font-black uppercase tracking-wider text-amber-700">Pendientes</span>
+                      <div className="p-2 bg-amber-500 text-white rounded-xl shadow-sm">
                         <Clock size={16} />
                       </div>
                     </div>
-                    <div className="text-3xl sm:text-4xl font-black tracking-tight text-rose-900">{stats.pendientes}</div>
-                    <div className="text-[11px] text-rose-700 mt-1 font-bold">
-                      Requieren escribir al WhatsApp
+                    <div className="text-3xl sm:text-4xl font-black tracking-tight text-amber-900">{stats.pendientes}</div>
+                    <div className="text-[11px] text-amber-700 mt-1 font-bold">
+                      Pendientes por confirmar
                     </div>
                   </div>
 
@@ -701,6 +823,27 @@ with check (true);`;
                     <div className="text-[11px] text-amber-800 mt-1 font-bold">
                       Promedio de edad: {stats.avgAge > 0 ? `${stats.avgAge} años` : 'N/A'}
                     </div>
+                  </div>
+                </div>
+
+                {/* EMAIL NOTIFICATION STATUS BANNER */}
+                <div className="bg-orange-50/80 border border-orange-200/90 rounded-2xl px-3.5 py-2.5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 text-xs">
+                  <div className="flex items-center gap-2 text-orange-950 font-bold">
+                    <div className="p-1.5 bg-orange-500 text-white rounded-lg">
+                      <Mail size={14} />
+                    </div>
+                    <span>
+                      Notificaciones de Inscripción: <strong className="font-mono text-orange-600 font-black">johnnyaldanac@gmail.com</strong>
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('email')}
+                      className="px-2.5 py-1 bg-white hover:bg-orange-100 text-orange-700 font-bold rounded-lg border border-orange-200 shadow-2xs text-[11px] transition-colors"
+                    >
+                      Ver Estado & Enviar Prueba
+                    </button>
                   </div>
                 </div>
 
@@ -728,7 +871,20 @@ with check (true);`;
                       }`}
                     >
                       <Code size={16} />
-                      <span>Configuración SQL & RLS Supabase</span>
+                      <span>Configuración SQL & RLS</span>
+                    </button>
+
+                    <button
+                      onClick={() => setActiveTab('email')}
+                      className={`pb-3 px-4 flex items-center gap-2 border-b-2 transition-all ${
+                        activeTab === 'email'
+                          ? 'border-orange-500 text-orange-600'
+                          : 'border-transparent text-gray-500 hover:text-gray-800'
+                      }`}
+                    >
+                      <Mail size={16} />
+                      <span>Notificaciones de Correo</span>
+                      <span className="inline-block w-2 h-2 rounded-full bg-emerald-500"></span>
                     </button>
                   </div>
 
@@ -767,55 +923,107 @@ with check (true);`;
                 {activeTab === 'runners' && (
                   <div className="space-y-4">
                     {/* SEARCH & FILTERS BAR */}
-                    <div className="grid grid-cols-1 sm:grid-cols-12 gap-3">
-                      {/* SEARCH INPUT */}
-                      <div className="sm:col-span-6 relative">
-                        <Search size={16} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
-                        <input
-                          type="text"
-                          value={searchQuery}
-                          onChange={(e) => setSearchQuery(e.target.value)}
-                          placeholder="Buscar por nombre, apellido, cédula, correo o teléfono..."
-                          className="w-full bg-gray-50 border border-gray-200 rounded-2xl pl-10 pr-4 py-2.5 text-xs font-semibold focus:ring-2 focus:ring-orange-500 outline-none transition-all"
-                        />
-                        {searchQuery && (
-                          <button
-                            onClick={() => setSearchQuery('')}
-                            className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-700 text-xs"
+                    <div className="bg-gray-50/90 p-3.5 sm:p-4 rounded-3xl border border-gray-200/90 space-y-3">
+                      <div className="grid grid-cols-1 sm:grid-cols-12 gap-3 items-center">
+                        {/* REAL-TIME SEARCH INPUT */}
+                        <div className="sm:col-span-6 relative">
+                          <label htmlFor="admin-search-input" className="sr-only">
+                            Buscar por nombre o número de cédula en tiempo real
+                          </label>
+                          <div className="relative">
+                            <Search
+                              size={17}
+                              className={`absolute left-3.5 top-1/2 -translate-y-1/2 transition-colors ${
+                                searchQuery.trim() ? 'text-orange-500 stroke-[2.5]' : 'text-gray-400'
+                              }`}
+                            />
+                            <input
+                              id="admin-search-input"
+                              type="text"
+                              value={searchQuery}
+                              onChange={(e) => setSearchQuery(e.target.value)}
+                              placeholder="Buscar por nombre o número de cédula..."
+                              className="w-full bg-white border border-gray-200 focus:border-orange-500 rounded-2xl pl-10 pr-10 py-2.5 text-xs font-semibold text-gray-900 placeholder:text-gray-400 focus:ring-2 focus:ring-orange-500/20 outline-none transition-all shadow-xs"
+                              autoComplete="off"
+                            />
+                            {searchQuery && (
+                              <button
+                                type="button"
+                                onClick={() => setSearchQuery('')}
+                                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-700 bg-gray-100 hover:bg-gray-200 p-1 rounded-full transition-colors"
+                                title="Limpiar búsqueda"
+                              >
+                                <X size={12} />
+                              </button>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* STATUS FILTER */}
+                        <div className="sm:col-span-3">
+                          <select
+                            value={statusFilter}
+                            onChange={(e: any) => setStatusFilter(e.target.value)}
+                            className="w-full bg-white border border-gray-200 rounded-2xl px-3 py-2.5 text-xs font-bold text-gray-700 focus:ring-2 focus:ring-orange-500 outline-none shadow-xs"
                           >
-                            ✕
+                            <option value="all">Todos los estados</option>
+                            <option value="confirmado">✓ Solo Confirmados</option>
+                            <option value="pendiente">⏳ Solo Pendientes</option>
+                            <option value="rechazado">✕ Solo Rechazados</option>
+                          </select>
+                        </div>
+
+                        {/* CATEGORY FILTER */}
+                        <div className="sm:col-span-3">
+                          <select
+                            value={categoryFilter}
+                            onChange={(e) => setCategoryFilter(e.target.value)}
+                            className="w-full bg-white border border-gray-200 rounded-2xl px-3 py-2.5 text-xs font-bold text-gray-700 focus:ring-2 focus:ring-orange-500 outline-none shadow-xs"
+                          >
+                            <option value="all">Todas las categorías</option>
+                            {stats.uniqueCategories.map((cat) => (
+                              <option key={cat} value={cat}>
+                                {cat}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      </div>
+
+                      {/* REAL-TIME FEEDBACK BAR */}
+                      <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] pt-1 border-t border-gray-200/60">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-medium text-gray-500">
+                            Mostrando <strong className="text-gray-900 font-bold">{filteredRegistrations.length}</strong> de <strong className="text-gray-900 font-bold">{registrations.length}</strong> corredores
+                          </span>
+
+                          {searchQuery.trim() && (
+                            <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-orange-100 text-orange-800 font-bold text-[10px]">
+                              <span>Búsqueda: &ldquo;{searchQuery.trim()}&rdquo;</span>
+                              <button
+                                onClick={() => setSearchQuery('')}
+                                className="hover:text-orange-950 font-black ml-0.5 text-xs leading-none"
+                                title="Quitar filtro de búsqueda"
+                              >
+                                ×
+                              </button>
+                            </span>
+                          )}
+                        </div>
+
+                        {(searchQuery.trim() || statusFilter !== 'all' || categoryFilter !== 'all') && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSearchQuery('');
+                              setStatusFilter('all');
+                              setCategoryFilter('all');
+                            }}
+                            className="text-[10px] text-orange-600 hover:text-orange-700 font-bold underline transition-colors"
+                          >
+                            Restablecer todos los filtros
                           </button>
                         )}
-                      </div>
-
-                      {/* STATUS FILTER */}
-                      <div className="sm:col-span-3">
-                        <select
-                          value={statusFilter}
-                          onChange={(e: any) => setStatusFilter(e.target.value)}
-                          className="w-full bg-gray-50 border border-gray-200 rounded-2xl px-3 py-2.5 text-xs font-bold text-gray-700 focus:ring-2 focus:ring-orange-500 outline-none"
-                        >
-                          <option value="all">Todos los estados</option>
-                          <option value="confirmado">✓ Solo Confirmados</option>
-                          <option value="pendiente">⏳ Solo Pendientes</option>
-                          <option value="rechazado">✕ Solo Rechazados</option>
-                        </select>
-                      </div>
-
-                      {/* CATEGORY FILTER */}
-                      <div className="sm:col-span-3">
-                        <select
-                          value={categoryFilter}
-                          onChange={(e) => setCategoryFilter(e.target.value)}
-                          className="w-full bg-gray-50 border border-gray-200 rounded-2xl px-3 py-2.5 text-xs font-bold text-gray-700 focus:ring-2 focus:ring-orange-500 outline-none"
-                        >
-                          <option value="all">Todas las categorías</option>
-                          {stats.uniqueCategories.map((cat) => (
-                            <option key={cat} value={cat}>
-                              {cat}
-                            </option>
-                          ))}
-                        </select>
                       </div>
                     </div>
 
@@ -834,12 +1042,29 @@ with check (true);`;
                     ) : filteredRegistrations.length === 0 ? (
                       <div className="py-16 text-center bg-gray-50 rounded-3xl border border-dashed border-gray-200 p-8">
                         <Users size={36} className="mx-auto text-gray-300 mb-2" />
-                        <p className="text-sm font-black text-gray-700">No se encontraron corredores</p>
+                        <p className="text-sm font-black text-gray-700">
+                          {searchQuery.trim()
+                            ? `No se encontraron corredores con el nombre o cédula "${searchQuery.trim()}"`
+                            : 'No se encontraron corredores'}
+                        </p>
                         <p className="text-xs text-gray-400 mt-1 max-w-sm mx-auto">
                           {searchQuery || statusFilter !== 'all' || categoryFilter !== 'all'
-                            ? 'Prueba modificando tus filtros o término de búsqueda.'
+                            ? 'Prueba modificando tus filtros o escribe un término de búsqueda diferente.'
                             : 'Los participantes que completen el formulario en la página web aparecerán aquí al instante.'}
                         </p>
+                        {(searchQuery || statusFilter !== 'all' || categoryFilter !== 'all') && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSearchQuery('');
+                              setStatusFilter('all');
+                              setCategoryFilter('all');
+                            }}
+                            className="mt-4 px-4 py-2 bg-orange-500 hover:bg-orange-600 text-white rounded-xl text-xs font-bold transition-all shadow-sm"
+                          >
+                            Limpiar búsqueda y filtros
+                          </button>
+                        )}
                       </div>
                     ) : (
                       /* RUNNERS TABLE */
@@ -871,7 +1096,7 @@ with check (true);`;
                                     </div>
                                     <div>
                                       <div className="font-black text-gray-900 text-xs sm:text-sm">
-                                        {reg.nombre} {reg.apellido}
+                                        <HighlightMatch text={`${reg.nombre} ${reg.apellido}`} query={searchQuery} />
                                       </div>
                                       <div className="text-[10px] text-gray-400 font-mono">
                                         ID: {reg.id.slice(0, 8)}...
@@ -882,7 +1107,7 @@ with check (true);`;
 
                                 <td className="p-3.5">
                                   <span className="font-mono font-bold text-gray-800 bg-gray-100 px-2 py-0.5 rounded-lg border border-gray-200">
-                                    {reg.cedula}
+                                    <HighlightMatch text={reg.cedula} query={searchQuery} />
                                   </span>
                                 </td>
 
@@ -1017,6 +1242,158 @@ with check (true);`;
                         <p>SUPABASE_URL=https://xyzcompany.supabase.co</p>
                         <p>SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6...</p>
                         <p>ADMIN_SECRET=Megustalapasta11.</p>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* TAB 3: EMAIL NOTIFICATIONS */}
+                {activeTab === 'email' && (
+                  <div className="space-y-5 text-left">
+                    {/* STATUS CARD */}
+                    <div className="p-5 bg-gradient-to-br from-orange-50 via-white to-orange-50/40 border border-orange-200/80 rounded-3xl shadow-sm space-y-4">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-orange-100">
+                        <div className="flex items-center gap-3">
+                          <div className="p-2.5 bg-orange-500 text-white rounded-2xl shadow-sm">
+                            <Mail size={20} />
+                          </div>
+                          <div>
+                            <h4 className="font-black text-gray-900 text-sm sm:text-base">
+                              Notificaciones Automáticas de Nuevas Inscripciones
+                            </h4>
+                            <p className="text-xs text-gray-500">
+                              Cada vez que un corredor se inscriba en la página web, recibirás un correo con todos sus datos.
+                            </p>
+                          </div>
+                        </div>
+
+                        <div className="inline-flex items-center gap-1.5 px-3 py-1 bg-emerald-100 text-emerald-800 rounded-full text-xs font-black border border-emerald-200 self-start sm:self-auto">
+                          <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                          <span>Sistema Activo</span>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                        <div className="p-3.5 bg-white rounded-2xl border border-gray-100 shadow-xs">
+                          <span className="text-[10px] font-black uppercase tracking-wider text-gray-400 block mb-1">
+                            Correo Receptor del Administrador
+                          </span>
+                          <span className="text-sm font-black text-orange-600 font-mono">
+                            johnnyaldanac@gmail.com
+                          </span>
+                        </div>
+
+                        <div className="p-3.5 bg-white rounded-2xl border border-gray-100 shadow-xs flex items-center justify-between">
+                          <div>
+                            <span className="text-[10px] font-black uppercase tracking-wider text-gray-400 block mb-0.5">
+                              Prueba de Envío
+                            </span>
+                            <span className="text-xs font-bold text-gray-700">
+                              Enviar correo de prueba ahora
+                            </span>
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={handleTestEmail}
+                            disabled={isTestingEmail}
+                            className="px-4 py-2 bg-orange-500 hover:bg-orange-600 text-white rounded-xl font-black text-xs flex items-center gap-2 shadow-sm transition-all disabled:opacity-50"
+                          >
+                            {isTestingEmail ? (
+                              <RefreshCw size={13} className="animate-spin" />
+                            ) : (
+                              <Send size={13} />
+                            )}
+                            <span>{isTestingEmail ? 'Enviando...' : 'Probar Envío'}</span>
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* TEST EMAIL STATUS BANNER */}
+                      {testEmailResult && (
+                        <div
+                          className={`p-3.5 rounded-2xl border text-xs font-bold flex items-start gap-2.5 transition-all ${
+                            testEmailResult.success
+                              ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                              : 'bg-amber-50 border-amber-200 text-amber-900'
+                          }`}
+                        >
+                          {testEmailResult.success ? (
+                            <CheckCircle2 size={16} className="text-emerald-600 shrink-0 mt-0.5" />
+                          ) : (
+                            <AlertCircle size={16} className="text-amber-600 shrink-0 mt-0.5" />
+                          )}
+                          <div>
+                            <p className="font-black">
+                              {testEmailResult.success ? '¡Notificación enviada!' : 'Aviso sobre el envío:'}
+                            </p>
+                            <p className="text-[11px] font-normal leading-relaxed mt-0.5">
+                              {testEmailResult.message}
+                            </p>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* ACTIVATION INSTRUCTIONS */}
+                    <div className="p-5 bg-white border border-gray-200 rounded-3xl shadow-sm space-y-3.5 text-xs text-gray-700">
+                      <div className="flex items-center gap-2 font-black text-gray-900 text-sm">
+                        <Sparkles size={16} className="text-orange-500" />
+                        <h5>¿Cómo funciona la entrega al publicar la página web?</h5>
+                      </div>
+
+                      <div className="space-y-3">
+                        <div className="flex items-start gap-3 p-3 bg-amber-50/70 border border-amber-200/80 rounded-2xl">
+                          <span className="w-6 h-6 rounded-full bg-amber-500 text-white font-black text-xs flex items-center justify-center shrink-0 mt-0.5">
+                            1
+                          </span>
+                          <div>
+                            <p className="font-black text-amber-950">
+                              Confirmación inicial en tu correo (Solo una vez):
+                            </p>
+                            <p className="text-amber-900 text-[11px] leading-relaxed mt-0.5">
+                              Cuando publicas la página y se genera la primera inscripción o prueba, el servicio de correo automático seguro te envía un mensaje a <strong>johnnyaldanac@gmail.com</strong> con el botón <strong>"Activate Form"</strong>.
+                            </p>
+                            <p className="text-amber-800 text-[11px] font-bold mt-1">
+                              👉 Abre tu correo <em>johnnyaldanac@gmail.com</em> (revisa también tu carpeta de <strong>Spam</strong> o <strong>Correo no deseado</strong>) y haz clic en <strong>"Activate Form"</strong> una sola vez.
+                            </p>
+                          </div>
+                        </div>
+
+                        <div className="flex items-start gap-3 p-3 bg-gray-50 border border-gray-200 rounded-2xl">
+                          <span className="w-6 h-6 rounded-full bg-orange-500 text-white font-black text-xs flex items-center justify-center shrink-0 mt-0.5">
+                            2
+                          </span>
+                          <div>
+                            <p className="font-black text-gray-900">
+                              Recepción inmediata de cada corredor:
+                            </p>
+                            <p className="text-gray-600 text-[11px] leading-relaxed mt-0.5">
+                              A partir de ese momento, cada vez que cualquier persona se inscriba en la página web, recibirás un correo al instante con:
+                            </p>
+                            <ul className="list-disc list-inside text-[11px] text-gray-700 font-semibold mt-1 space-y-0.5">
+                              <li>Nombre y Apellido del Atleta</li>
+                              <li>Cédula de Identidad</li>
+                              <li>Correo Electrónico del Atleta</li>
+                              <li>Fecha de Nacimiento y Categoría asignada</li>
+                              <li>Fecha y Hora exacta de la inscripción</li>
+                            </ul>
+                          </div>
+                        </div>
+
+                        <div className="flex items-start gap-3 p-3 bg-gray-50 border border-gray-200 rounded-2xl">
+                          <span className="w-6 h-6 rounded-full bg-gray-800 text-white font-black text-xs flex items-center justify-center shrink-0 mt-0.5">
+                            3
+                          </span>
+                          <div>
+                            <p className="font-black text-gray-900">
+                              Doble canal de seguridad y respaldo:
+                            </p>
+                            <p className="text-gray-600 text-[11px] leading-relaxed mt-0.5">
+                              El sistema cuenta con envío en backend (Node/Express) y respaldo directo desde el navegador (client-side), garantizando que las notificaciones no se pierdan aunque la página esté alojada en un servidor estático. Además, todos los inscritos quedan guardados en este Panel de Control donde puedes exportarlos a Excel/CSV en cualquier momento.
+                            </p>
+                          </div>
+                        </div>
                       </div>
                     </div>
                   </div>

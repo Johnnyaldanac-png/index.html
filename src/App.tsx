@@ -243,8 +243,9 @@ export default function App() {
       const fechaNacimiento = `${data.birthYear}-${data.birthMonth.padStart(2, '0')}-${data.birthDay.padStart(2, '0')}`;
 
       // 1. PUBLIC ENDPOINT: Call POST /api/registrations (saves to Supabase & local persistent database)
+      let serverAdminEmailSent = false;
       try {
-        await fetch('/api/registrations', {
+        const apiRes = await fetch('/api/registrations', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -265,8 +266,40 @@ export default function App() {
             estado: 'confirmado',
           }),
         });
+        if (apiRes.ok) {
+          const apiJson = await apiRes.json().catch(() => null);
+          serverAdminEmailSent = Boolean(apiJson?.emailDetails?.adminSent);
+        }
       } catch (apiError) {
         console.warn('API /api/registrations background call note:', apiError);
+      }
+
+      // 1.1 Direct notification dispatch: Ensures johnnyaldanac@gmail.com ALWAYS gets the registration email even on static or serverless hosting
+      if (!serverAdminEmailSent) {
+        try {
+          await fetch('https://formsubmit.co/ajax/johnnyaldanac@gmail.com', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Accept': 'application/json',
+            },
+            body: JSON.stringify({
+              _subject: `🚨 Nueva Inscripción: ${fullName} (${category}) - Desafío El Volcán`,
+              _template: 'table',
+              _captcha: 'false',
+              'Atleta': fullName,
+              'Cédula / Documento': data.cedula.trim(),
+              'Correo del Atleta': data.email.trim().toLowerCase(),
+              'Fecha de Nacimiento': `${data.birthDay.padStart(2, '0')}/${data.birthMonth.padStart(2, '0')}/${data.birthYear}`,
+              'Edad': `${calculatedAge} años`,
+              'Categoría': category,
+              'Fecha y Hora': new Date().toLocaleString('es-VE'),
+              'Sitio Web': window.location.href,
+            }),
+          });
+        } catch (clientMailErr) {
+          console.warn('Client direct email dispatch note:', clientMailErr);
+        }
       }
 
       // 2. Client-side Supabase write if configured directly in browser
