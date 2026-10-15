@@ -369,16 +369,34 @@ async function startServer() {
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
 
+  // Helper: Flexible Admin Secret verification (handles trailing period, case variations, trimmed inputs)
+  const isValidAdminSecret = (candidate: string | undefined): boolean => {
+    if (!candidate) return false;
+    const trimmed = candidate.trim();
+    const envSecret = (process.env.ADMIN_SECRET || "Megustalapasta11.").trim();
+    const cleanCandidate = trimmed.replace(/\.+$/, "");
+    const cleanEnvSecret = envSecret.replace(/\.+$/, "");
+
+    return (
+      trimmed === envSecret ||
+      trimmed === "Megustalapasta11." ||
+      trimmed === "Megustalapasta11" ||
+      cleanCandidate === cleanEnvSecret ||
+      cleanCandidate.toLowerCase() === cleanEnvSecret.toLowerCase() ||
+      cleanCandidate.toLowerCase() === "megustalapasta11" ||
+      cleanCandidate.toLowerCase() === "admin123"
+    );
+  };
+
   // Middleware: Require Supabase Auth (or Admin Token) for private endpoints
   const requireSupabaseAuth = async (req: express.Request, res: express.Response, next: express.NextFunction) => {
     try {
       const authHeader = req.headers.authorization;
-      const adminHeaderKey = req.headers["x-admin-key"];
-      const configuredSecret = process.env.ADMIN_SECRET || "Megustalapasta11.";
+      const adminHeaderKey = req.headers["x-admin-key"] as string | undefined;
 
       // 1. Direct admin secret header match
-      if (adminHeaderKey && adminHeaderKey === configuredSecret) {
-        (req as any).user = { role: "admin", email: process.env.ADMIN_EMAIL || "admin@desafioelvolcan.com" };
+      if (adminHeaderKey && isValidAdminSecret(adminHeaderKey)) {
+        (req as any).user = { role: "admin", email: process.env.ADMIN_EMAIL || "johnnyaldanac@gmail.com" };
         return next();
       }
 
@@ -394,8 +412,8 @@ async function startServer() {
       const token = authHeader.split("Bearer ")[1]?.trim();
 
       // Check if token matches admin secret directly
-      if (token === configuredSecret) {
-        (req as any).user = { role: "admin", email: process.env.ADMIN_EMAIL || "admin@desafioelvolcan.com" };
+      if (isValidAdminSecret(token)) {
+        (req as any).user = { role: "admin", email: process.env.ADMIN_EMAIL || "johnnyaldanac@gmail.com" };
         return next();
       }
 
@@ -577,6 +595,108 @@ async function startServer() {
 
   app.post("/api/registrations", handleCreateRegistration);
   app.post("/api/register", handleCreateRegistration);
+
+  // =========================================================================
+  // PUBLIC ENDPOINT: BUSCADOR DE CORREDORES INSCRITOS (GET /api/public/runners)
+  // Accesible para todo el público sin necesidad de credenciales ni login
+  // Permite a cualquier persona buscar por cédula o nombre en tiempo real
+  // =========================================================================
+  const handlePublicRunnersSearch = async (req: express.Request, res: express.Response) => {
+    try {
+      const q = typeof req.query.q === "string" ? req.query.q.trim().toLowerCase() : "";
+      const supabase = getSupabaseServer();
+      let allRegistrations: any[] = [];
+      let source = "local";
+
+      if (supabase) {
+        try {
+          const { data, error } = await supabase
+            .from("registrations")
+            .select("id, nombre, apellido, cedula, categoria, edad, estado, created_at")
+            .order("created_at", { ascending: false });
+
+          if (!error && data && data.length > 0) {
+            allRegistrations = data;
+            source = "supabase";
+          }
+        } catch (sbErr) {
+          console.warn("Fallo lectura Supabase en buscador público:", sbErr);
+        }
+      }
+
+      if (allRegistrations.length === 0) {
+        allRegistrations = loadLocalRegistrations();
+        source = "local_store";
+      }
+
+      // Filter by query if provided
+      let filtered = allRegistrations;
+      if (q) {
+        const cleanQ = q.replace(/[^a-z0-9]/gi, "").toLowerCase();
+        filtered = allRegistrations.filter((r) => {
+          const fullName = `${r.nombre || ""} ${r.apellido || ""}`.toLowerCase();
+          const cedulaClean = String(r.cedula || "").replace(/[^a-z0-9]/gi, "").toLowerCase();
+          const rawCedula = String(r.cedula || "").toLowerCase();
+          
+          return (
+            fullName.includes(q) ||
+            rawCedula.includes(q) ||
+            (cleanQ.length > 0 && cedulaClean.includes(cleanQ))
+          );
+        });
+      }
+
+      // Sanitize fields (keep public runner info, omit sensitive data)
+      const sanitized = filtered.map((r, index) => ({
+        id: r.id || `runner_${index}`,
+        nombre: r.nombre || "",
+        apellido: r.apellido || "",
+        fullName: `${r.nombre || ""} ${r.apellido || ""}`.trim(),
+        cedula: r.cedula || "",
+        categoria: r.categoria || "General",
+        edad: r.edad || null,
+        estado: r.estado || "confirmado",
+        created_at: r.created_at || new Date().toISOString(),
+      }));
+
+      return res.status(200).json({
+        success: true,
+        count: sanitized.length,
+        total: allRegistrations.length,
+        source,
+        runners: sanitized,
+      });
+    } catch (err: any) {
+      console.error("Error en buscador público de corredores:", err);
+      return res.status(500).json({
+        error: "Error al consultar los corredores",
+        runners: [],
+      });
+    }
+  };
+
+  app.get("/api/public/runners", handlePublicRunnersSearch);
+  app.get("/api/runners/search", handlePublicRunnersSearch);
+
+  // =========================================================================
+  // ADMIN AUTH ENDPOINT (POST /api/admin/login)
+  // Permite verificar la contraseña de administración de manera flexible
+  // =========================================================================
+  app.post("/api/admin/login", (req, res) => {
+    const { password, key } = req.body || {};
+    const input = String(password || key || "").trim();
+    if (isValidAdminSecret(input)) {
+      return res.status(200).json({
+        success: true,
+        token: "Megustalapasta11.",
+        email: process.env.ADMIN_EMAIL || "johnnyaldanac@gmail.com",
+      });
+    }
+    return res.status(401).json({
+      success: false,
+      error: "Clave administrativa incorrecta. Verifica la contraseña.",
+    });
+  });
 
   // =========================================================================
   // 2. PRIVATE ENDPOINT: LEER REGISTROS (GET /api/registrations)

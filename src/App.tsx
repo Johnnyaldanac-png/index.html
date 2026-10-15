@@ -33,11 +33,13 @@ import {
   ExternalLink,
   FileText,
   Settings,
-  Database
+  Database,
+  Search
 } from 'lucide-react';
 import { APP_CONFIG } from './config';
 import { AboutGallery } from './components/AboutGallery';
 import { AdminRegistrationsModal } from './components/AdminRegistrationsModal';
+import { PublicRunnerSearchModal } from './components/PublicRunnerSearchModal';
 import { createSupabaseRegistration, isSupabaseConfigured } from './lib/supabase';
 import { auth, db } from './lib/firebase';
 import { collection, addDoc, serverTimestamp, query, where, getDocs } from 'firebase/firestore';
@@ -127,6 +129,7 @@ export default function App() {
   });
   const [showLoginModal, setShowLoginModal] = useState(false);
   const [showAdminModal, setShowAdminModal] = useState(false);
+  const [showPublicSearchModal, setShowPublicSearchModal] = useState(false);
   const [loginForm, setLoginForm] = useState({ fullName: '', idNumber: '' });
 
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -241,6 +244,30 @@ export default function App() {
       const category = getCategoryByAge(calculatedAge);
       const fullName = `${data.nombre.trim()} ${data.apellido.trim()}`;
       const fechaNacimiento = `${data.birthYear}-${data.birthMonth.padStart(2, '0')}-${data.birthDay.padStart(2, '0')}`;
+
+      // 1.0 Save to browser local storage for instant search & offline access
+      try {
+        const localRaw = localStorage.getItem('race_local_registrations');
+        const localList = localRaw ? JSON.parse(localRaw) : [];
+        const newLocalRecord = {
+          id: `reg_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          nombre: data.nombre.trim(),
+          apellido: data.apellido.trim(),
+          fullName,
+          cedula: data.cedula.trim(),
+          correo_electronico: data.email.trim().toLowerCase(),
+          fecha_nacimiento: fechaNacimiento,
+          categoria: category,
+          edad: calculatedAge,
+          estado: 'confirmado',
+          created_at: new Date().toISOString(),
+        };
+        const filtered = localList.filter((r: any) => r.cedula !== data.cedula.trim());
+        filtered.unshift(newLocalRecord);
+        localStorage.setItem('race_local_registrations', JSON.stringify(filtered));
+      } catch (lsErr) {
+        console.warn('LocalStorage save note:', lsErr);
+      }
 
       // 1. PUBLIC ENDPOINT: Call POST /api/registrations (saves to Supabase & local persistent database)
       let serverAdminEmailSent = false;
@@ -389,19 +416,34 @@ export default function App() {
   };
 
   const NavMenu = () => (
-    <div className="fixed top-4 sm:top-6 right-4 sm:right-6 z-50 flex items-center gap-2.5">
+    <div className="fixed top-4 sm:top-6 right-4 sm:right-6 z-50 flex items-center gap-2 sm:gap-2.5">
+      {/* PUBLIC RUNNER SEARCH BUTTON (OPEN FOR EVERYONE) */}
+      <button
+        onClick={() => setShowPublicSearchModal(true)}
+        className="flex items-center gap-2 bg-white hover:bg-orange-50 text-gray-800 hover:text-orange-600 px-3 sm:px-3.5 py-2.5 sm:py-3 rounded-2xl shadow-xl border border-gray-200/90 transition-all active:scale-95 group"
+        title="Buscar corredores inscritos por cédula o nombre (público para todos)"
+      >
+        <div className="p-1 bg-orange-100 text-orange-600 rounded-lg group-hover:scale-110 transition-transform">
+          <Search size={14} className="stroke-[2.5]" />
+        </div>
+        <div className="flex flex-col text-left">
+          <span className="text-xs font-black tracking-tight leading-none">Buscar Corredor</span>
+          <span className="text-[9px] text-gray-500 font-bold leading-none mt-0.5 hidden xs:inline">Cédula o Nombre</span>
+        </div>
+      </button>
+
       {/* DIRECT CONTROL PANEL BUTTON */}
       <button
         onClick={() => setShowAdminModal(true)}
         className="flex items-center gap-2 bg-gradient-to-r from-gray-900 to-gray-800 hover:from-black hover:to-gray-900 text-white px-3.5 sm:px-4 py-2.5 sm:py-3 rounded-2xl shadow-xl border border-gray-700/60 transition-all active:scale-95 group"
-        title="Abrir Panel de Control de Corredores"
+        title="Abrir Panel de Control de Corredores (Administración)"
       >
         <div className="p-1 bg-orange-500 rounded-lg text-white group-hover:scale-110 transition-transform">
           <Users size={14} className="stroke-[2.5]" />
         </div>
         <div className="flex flex-col text-left">
           <span className="text-xs font-black tracking-tight leading-none">Panel de Control</span>
-          <span className="text-[9px] text-orange-400 font-bold leading-none mt-0.5">Corredores</span>
+          <span className="text-[9px] text-orange-400 font-bold leading-none mt-0.5">Admin</span>
         </div>
       </button>
 
@@ -493,6 +535,22 @@ export default function App() {
                     <span>Acceder / Historial</span>
                   </button>
                 )}
+
+                <button
+                  onClick={() => {
+                    setShowPublicSearchModal(true);
+                    setIsMenuOpen(false);
+                  }}
+                  className="w-full flex items-center space-x-3 p-3 rounded-2xl font-black text-orange-700 bg-orange-50 hover:bg-orange-100 transition-all text-left mt-2 border border-orange-200/80 shadow-xs"
+                >
+                  <div className="p-1.5 bg-orange-500 text-white rounded-xl">
+                    <Search size={16} />
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="text-xs font-black">Buscar Corredor</span>
+                    <span className="text-[9px] text-orange-600 font-bold">Consultar por Cédula o Nombre</span>
+                  </div>
+                </button>
 
                 <button
                   onClick={() => {
@@ -692,21 +750,32 @@ export default function App() {
                   className="space-y-6 text-left"
                 >
                   <div className="space-y-4">
-                    <div className="flex items-center justify-between mb-6">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-6">
                       <div>
                         <h2 className="text-2xl font-black tracking-tight">Formulario de Registro</h2>
                         <p className="text-xs text-gray-500 font-medium mt-0.5">Completa los datos del participante para asegurar su cupo.</p>
                       </div>
-                      {!session && (
+                      <div className="flex items-center gap-2">
                         <button
                           type="button"
-                          onClick={() => setShowLoginModal(true)}
-                          className="flex items-center space-x-2 px-4 py-2 bg-white border border-gray-200 rounded-xl text-xs font-bold hover:bg-gray-50 transition-all shadow-sm"
+                          onClick={() => setShowPublicSearchModal(true)}
+                          className="flex items-center space-x-1.5 px-3.5 py-2 bg-orange-50 hover:bg-orange-100 text-orange-700 border border-orange-200/80 rounded-xl text-xs font-black transition-all shadow-xs"
+                          title="Buscar corredores inscritos en tiempo real"
                         >
-                          <UserIcon size={12} />
-                          <span>Acceso Rápido</span>
+                          <Search size={13} className="text-orange-600 stroke-[2.5]" />
+                          <span>Buscar Corredor</span>
                         </button>
-                      )}
+                        {!session && (
+                          <button
+                            type="button"
+                            onClick={() => setShowLoginModal(true)}
+                            className="flex items-center space-x-2 px-3.5 py-2 bg-white border border-gray-200 rounded-xl text-xs font-bold hover:bg-gray-50 transition-all shadow-xs"
+                          >
+                            <UserIcon size={12} />
+                            <span>Acceso Rápido</span>
+                          </button>
+                        )}
+                      </div>
                     </div>
                     
                     {/* NOMBRE Y APELLIDO (SEPARADOS) */}
@@ -957,11 +1026,20 @@ export default function App() {
 
                       <button 
                         type="button"
+                        onClick={() => setShowPublicSearchModal(true)}
+                        className="flex items-center justify-center gap-2 p-3.5 bg-gradient-to-r from-orange-500 to-amber-500 hover:from-orange-600 hover:to-amber-600 text-white rounded-2xl text-xs font-black transition-all shadow-md shadow-orange-500/20 active:scale-[0.98]"
+                      >
+                        <Search size={16} />
+                        <span>Ver Lista de Corredores Inscritos</span>
+                      </button>
+
+                      <button 
+                        type="button"
                         onClick={() => {
                           setIsSubmitted(false);
                           reset();
                         }}
-                        className="flex items-center justify-center gap-2 p-3.5 bg-orange-50 hover:bg-orange-100 text-orange-700 rounded-2xl text-xs font-bold transition-all border border-orange-200 active:scale-[0.98]"
+                        className="sm:col-span-2 flex items-center justify-center gap-2 p-3 bg-gray-50 hover:bg-gray-100 text-gray-700 rounded-2xl text-xs font-bold transition-all border border-gray-200 active:scale-[0.98]"
                       >
                         <span>Inscribir a otro participante</span>
                       </button>
@@ -1237,6 +1315,16 @@ export default function App() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* PUBLIC RUNNER SEARCH MODAL (FOR EVERYONE) */}
+      <PublicRunnerSearchModal
+        isOpen={showPublicSearchModal}
+        onClose={() => setShowPublicSearchModal(false)}
+        onGoToRegister={() => {
+          setCurrentView('register');
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+        }}
+      />
 
       {/* ADMIN / SUPABASE REGISTRATIONS MODAL */}
       <AdminRegistrationsModal
